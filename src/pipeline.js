@@ -173,17 +173,17 @@ async function runPipeline(runId) {
         `Credit check OK — no2bounce today ${n2bUsedToday}/${config.n2bDailyCreditCeiling}`
       );
 
-      n2bResults = await validateBulk(candidates, {
+      const n2b = await validateBulk(candidates, {
         onProgress: async (message) => {
           await addLog(runId, message);
         },
       });
+      n2bResults = n2b.results;
+      n2bCredits = n2b.creditsUsed;
 
       for (const result of n2bResults.values()) {
         if (result.deliverable) n2bDeliverable += 1;
       }
-      // no2bounce typically charges 1 credit per validated address
-      n2bCredits = candidates.length;
 
       await updateRun(runId, {
         n2b_deliverable_count: n2bDeliverable,

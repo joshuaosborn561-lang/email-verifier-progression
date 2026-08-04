@@ -1,15 +1,35 @@
+import { parse } from 'csv-parse/sync';
 import { config } from '../config.js';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function isDeliverableStatus(value) {
+  const status = String(value || '').toLowerCase();
+  return (
+    status === 'deliverable' ||
+    status === 'deliverable/acceptall' ||
+    status === 'valid' ||
+    status === 'ok' ||
+    status === 'safe' ||
+    status === 'good'
+  );
+}
+
 /**
  * Submit emails to no2bounce bulk validation and poll until complete.
- * Returns Map<email, { deliverable: boolean, status: string }>
+ * Returns { results: Map<email,{deliverable,status}>, creditsUsed: number }
+ *
+ * Response shape (confirmed):
+ * {
+ *   trackingId, overallStatus: "Completed", percent: 100,
+ *   result: { downloadFile: "https://..." },
+ *   creditDebited, Deliverable, Undeliverable, ...
+ * }
  */
 export async function validateBulk(emails, { onProgress } = {}) {
-  if (!emails.length) return new Map();
+  if (!emails.length) return { results: new Map(), creditsUsed: 0 };
 
   const submitRes = await fetch(`${config.no2bounceBaseUrl}/n2b_validate_bulk`, {
     method: 'POST',
@@ -43,7 +63,7 @@ export async function validateBulk(emails, { onProgress } = {}) {
 
   let delayMs = 5_000;
   const maxDelay = 30_000;
-  const deadline = Date.now() + 60 * 60 * 1000; // 1 hour safety
+  const deadline = Date.now() + 60 * 60 * 1000;
 
   while (Date.now() < deadline) {
     await sleep(delayMs);
@@ -61,31 +81,55 @@ export async function validateBulk(emails, { onProgress } = {}) {
       );
     }
 
-    const status = String(
-      pollBody.status || pollBody.data?.status || pollBody.jobStatus || ''
+    const overallStatus = String(
+      pollBody.overallStatus || pollBody.status || pollBody.data?.status || ''
     ).toLowerCase();
+    const percent = Number(pollBody.percent ?? pollBody.progress ?? 0);
 
-    const results =
-      pollBody.results ||
-      pollBody.data?.results ||
-      pollBody.emailResults ||
-      pollBody.data?.emailList ||
+    const downloadFile =
+      pollBody.result?.downloadFile ||
+      pollBody.downloadFile ||
+      pollBody.data?.downloadFile ||
       null;
 
     const done =
-      ['completed', 'complete', 'done', 'finished', 'success'].includes(status) ||
-      (Array.isArray(results) && results.length > 0 && !['pending', 'processing', 'queued', 'in_progress', 'running'].includes(status));
+      ['completed', 'complete', 'done', 'finished', 'success'].includes(overallStatus) ||
+      (percent >= 100 && downloadFile);
 
-    if (done && Array.isArray(results)) {
-      return normalizeResults(results, emails);
+    if (done) {
+      const creditsUsed = Number(pollBody.creditDebited ?? pollBody.totalCredit ?? emails.length) || emails.length;
+      if (downloadFile) {
+        const map = await downloadAndParseResults(downloadFile, emails);
+        if (onProgress) {
+          const deliverable = [...map.values()].filter((r) => r.deliverable).length;
+          await onProgress(
+            `no2bounce completed (creditDebited=${creditsUsed}, deliverable=${deliverable}/${emails.length})`
+          );
+        }
+        return { results: map, creditsUsed };
+      }
+
+      // Fallback: inline results if ever present
+      const results =
+        pollBody.results ||
+        pollBody.data?.results ||
+        pollBody.emailResults ||
+        null;
+      if (Array.isArray(results)) {
+        return { results: normalizeInlineResults(results, emails), creditsUsed };
+      }
+
+      throw new Error('no2bounce completed but no downloadFile/results were returned');
     }
 
-    if (['failed', 'error', 'cancelled'].includes(status)) {
-      throw new Error(pollBody.message || `no2bounce job failed: ${status}`);
+    if (['failed', 'error', 'cancelled'].includes(overallStatus)) {
+      throw new Error(pollBody.message || `no2bounce job failed: ${overallStatus}`);
     }
 
     if (onProgress) {
-      await onProgress(`no2bounce still processing (status=${status || 'unknown'}), next poll in ${delayMs / 1000}s`);
+      await onProgress(
+        `no2bounce still processing (overallStatus=${overallStatus || 'pending'}, percent=${percent}), next poll in ${Math.round(delayMs / 1000)}s`
+      );
     }
 
     delayMs = Math.min(maxDelay, Math.round(delayMs * 1.4));
@@ -94,25 +138,28 @@ export async function validateBulk(emails, { onProgress } = {}) {
   throw new Error('no2bounce polling timed out');
 }
 
-function normalizeResults(results, requestedEmails) {
+async function downloadAndParseResults(url, requestedEmails) {
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Failed to download no2bounce results CSV (HTTP ${res.status})`);
+  }
+  const text = await res.text();
+  const rows = parse(text, {
+    columns: true,
+    skip_empty_lines: true,
+    relax_column_count: true,
+    trim: true,
+    bom: true,
+  });
+
   const map = new Map();
-
-  for (const item of results) {
-    const email = String(item.email || item.Email || item.address || '').toLowerCase();
+  for (const row of rows) {
+    const email = String(row.email || row.Email || '').toLowerCase();
     if (!email) continue;
-
-    const rawStatus = String(
-      item.status || item.result || item.validation_status || item.deliverability || ''
-    ).toLowerCase();
-
-    const deliverable =
-      item.deliverable === true ||
-      item.isDeliverable === true ||
-      ['deliverable', 'valid', 'ok', 'safe', 'good'].includes(rawStatus);
-
+    const status = String(row.finalScoreValue || row.status || row.result || '').trim();
     map.set(email, {
-      deliverable,
-      status: rawStatus || (deliverable ? 'deliverable' : 'undeliverable'),
+      deliverable: isDeliverableStatus(status),
+      status: status || 'unknown',
     });
   }
 
@@ -123,5 +170,27 @@ function normalizeResults(results, requestedEmails) {
     }
   }
 
+  return map;
+}
+
+function normalizeInlineResults(results, requestedEmails) {
+  const map = new Map();
+  for (const item of results) {
+    const email = String(item.email || item.Email || item.address || '').toLowerCase();
+    if (!email) continue;
+    const rawStatus = String(
+      item.finalScoreValue || item.status || item.result || item.validation_status || ''
+    ).trim();
+    map.set(email, {
+      deliverable: isDeliverableStatus(rawStatus) || item.deliverable === true,
+      status: rawStatus || 'unknown',
+    });
+  }
+  for (const email of requestedEmails) {
+    const key = email.toLowerCase();
+    if (!map.has(key)) {
+      map.set(key, { deliverable: false, status: 'unknown' });
+    }
+  }
   return map;
 }
