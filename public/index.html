@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Email Verification Waterfall</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="top">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div>
+          <h1>VerifyFall</h1>
+          <p class="tagline">BillionVerify → no2bounce waterfall</p>
+        </div>
+      </div>
+      <nav class="tabs" role="tablist">
+        <button type="button" class="tab active" data-view="upload">Upload</button>
+        <button type="button" class="tab" data-view="history">History</button>
+      </nav>
+    </header>
+
+    <main>
+      <section id="view-upload" class="view active">
+        <div
+          id="dropzone"
+          class="dropzone"
+          tabindex="0"
+          role="button"
+          aria-label="Upload CSV files"
+        >
+          <div class="dropzone-inner">
+            <p class="dropzone-title">Drop CSV files here</p>
+            <p class="dropzone-sub">or click to select — one run per file, Email column required</p>
+            <input id="file-input" type="file" accept=".csv,text/csv" multiple hidden />
+          </div>
+        </div>
+        <div id="upload-status" class="upload-status" hidden></div>
+      </section>
+
+      <section id="view-history" class="view">
+        <div class="table-wrap">
+          <table id="runs-table">
+            <thead>
+              <tr>
+                <th>Segment</th>
+                <th>Status</th>
+                <th>Emails</th>
+                <th>Sendable</th>
+                <th>Rejected</th>
+                <th>BV credits</th>
+                <th>N2B credits</th>
+                <th>Created</th>
+              </tr>
+            </thead>
+            <tbody id="runs-body">
+              <tr><td colspan="8" class="muted">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="view-detail" class="view">
+        <button type="button" class="back" id="back-btn">← Back to history</button>
+        <div id="detail-header" class="detail-header"></div>
+        <div id="detail-downloads" class="downloads" hidden></div>
+        <div class="log-panel">
+          <h2>Run log</h2>
+          <pre id="log-stream" class="log-stream"></pre>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
