@@ -216,6 +216,7 @@ tbody tr:hover { background: rgba(62, 207, 142, 0.06); }
 
 .badge.queued { color: var(--muted); }
 .badge.verifying_bv,
+.badge.verifying_mv,
 .badge.verifying_n2b,
 .badge.merging { color: var(--info); }
 .badge.completed { color: var(--accent); }

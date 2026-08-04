@@ -2,11 +2,11 @@
 
 Node.js/Express dashboard + MCP server that runs an email verification waterfall:
 
-1. **BillionVerify** (batch of 50) — classify valid / catchall / unknown / invalid  
-2. **no2bounce** — re-check only catchall + unknown  
-3. **Merge** — BV valid + N2B deliverable → SENDABLE; everything else → REJECTED  
+1. **MillionVerifier** (bulk file API) — classify `ok` / `catch_all` / `unknown` / `invalid`
+2. **no2bounce** — re-check only `catch_all` + `unknown`
+3. **Merge** — MV `ok` + N2B Deliverable → sendable (`confidence=confirmed`); N2B `Deliverable/AcceptAll` → sendable (`confidence=unresolved_catchall`); everything else → rejected
 
-CSV columns are preserved; only `verification_source` and `verification_status` are added.
+CSV columns are preserved; only `verification_source`, `verification_status`, and `confidence` are added.
 
 ## Stack
 
@@ -19,7 +19,7 @@ CSV columns are preserved; only `verification_source` and `verification_status` 
 
 | Variable | Description |
 |---|---|
-| `BILLIONVERIFY_API_KEY` | BillionVerify API key |
+| `MILLIONVERIFIER_API_KEY` | MillionVerifier API key |
 | `NO2BOUNCE_API_TOKEN` | no2bounce API token |
 | `SUPABASE_URL` | `https://azpapwtnrbzywlnxxecz.supabase.co` |
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase service role key |
@@ -49,7 +49,7 @@ Endpoint: `POST /mcp` (Streamable HTTP). Responses are summary-only — never fu
 
 ## Credit ceilings
 
-- BillionVerify: pause if today's usage + projected > **95,000**
+- MillionVerifier: pause if projected worst-case usage > **50% of remaining balance**
 - no2bounce: pause if today's usage + projected > **19,000**
 
 Paused runs are logged and left in `paused` status (no service crash).

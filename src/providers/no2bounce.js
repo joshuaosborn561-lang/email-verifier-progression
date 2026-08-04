@@ -5,16 +5,27 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function normalizeN2bStatus(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '');
+}
+
+/** Strict Deliverable (not AcceptAll). */
+export function isStrictDeliverable(value) {
+  const status = normalizeN2bStatus(value);
+  return status === 'deliverable' || status === 'valid' || status === 'ok' || status === 'safe' || status === 'good';
+}
+
+/** Deliverable/AcceptAll — sendable but lower confidence. */
+export function isAcceptAllDeliverable(value) {
+  const status = normalizeN2bStatus(value);
+  return status === 'deliverable/acceptall' || status === 'deliverableacceptall';
+}
+
 function isDeliverableStatus(value) {
-  const status = String(value || '').toLowerCase();
-  return (
-    status === 'deliverable' ||
-    status === 'deliverable/acceptall' ||
-    status === 'valid' ||
-    status === 'ok' ||
-    status === 'safe' ||
-    status === 'good'
-  );
+  return isStrictDeliverable(value) || isAcceptAllDeliverable(value);
 }
 
 /**
@@ -159,6 +170,8 @@ async function downloadAndParseResults(url, requestedEmails) {
     const status = String(row.finalScoreValue || row.status || row.result || '').trim();
     map.set(email, {
       deliverable: isDeliverableStatus(status),
+      acceptAll: isAcceptAllDeliverable(status),
+      strictDeliverable: isStrictDeliverable(status),
       status: status || 'unknown',
     });
   }
@@ -166,7 +179,12 @@ async function downloadAndParseResults(url, requestedEmails) {
   for (const email of requestedEmails) {
     const key = email.toLowerCase();
     if (!map.has(key)) {
-      map.set(key, { deliverable: false, status: 'unknown' });
+      map.set(key, {
+        deliverable: false,
+        acceptAll: false,
+        strictDeliverable: false,
+        status: 'unknown',
+      });
     }
   }
 
@@ -181,15 +199,23 @@ function normalizeInlineResults(results, requestedEmails) {
     const rawStatus = String(
       item.finalScoreValue || item.status || item.result || item.validation_status || ''
     ).trim();
+    const deliverable = isDeliverableStatus(rawStatus) || item.deliverable === true;
     map.set(email, {
-      deliverable: isDeliverableStatus(rawStatus) || item.deliverable === true,
+      deliverable,
+      acceptAll: isAcceptAllDeliverable(rawStatus),
+      strictDeliverable: isStrictDeliverable(rawStatus),
       status: rawStatus || 'unknown',
     });
   }
   for (const email of requestedEmails) {
     const key = email.toLowerCase();
     if (!map.has(key)) {
-      map.set(key, { deliverable: false, status: 'unknown' });
+      map.set(key, {
+        deliverable: false,
+        acceptAll: false,
+        strictDeliverable: false,
+        status: 'unknown',
+      });
     }
   }
   return map;

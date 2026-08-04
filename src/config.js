@@ -21,17 +21,21 @@ export const config = {
   get supabaseServiceRoleKey() {
     return required('SUPABASE_SERVICE_ROLE_KEY');
   },
+  get millionVerifierApiKey() {
+    return required('MILLIONVERIFIER_API_KEY');
+  },
+  // Kept for backward compatibility; no longer used by the pipeline
   get billionVerifyApiKey() {
-    return required('BILLIONVERIFY_API_KEY');
+    return process.env.BILLIONVERIFY_API_KEY || '';
   },
   get no2bounceApiToken() {
     return required('NO2BOUNCE_API_TOKEN');
   },
-  bvBatchSize: 50,
-  bvDailyCreditCeiling: 95_000,
   n2bDailyCreditCeiling: 19_000,
+  mvBalanceFractionCeiling: 0.5, // pause if projected usage > 50% of remaining MV credits
   uploadsBucket: 'verification-uploads',
   resultsBucket: 'verification-results',
-  billionVerifyBaseUrl: 'https://api.billionverify.com/v1',
+  millionVerifierBulkUrl: 'https://bulkapi.millionverifier.com/bulkapi/v2',
+  millionVerifierCreditsUrl: 'https://api.millionverifier.com/api/v3/credits',
   no2bounceBaseUrl: 'https://connect.no2bounce.com/v2',
 };

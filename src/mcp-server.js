@@ -10,6 +10,7 @@ import { createSignedUrl } from './storage.js';
 import { config } from './config.js';
 
 function summarizeRun(run) {
+  const mvCredits = run.mv_credits_used ?? 0;
   return {
     run_id: run.id,
     segment_name: run.segment_name,
@@ -17,7 +18,13 @@ function summarizeRun(run) {
     total_emails: run.total_emails,
     final_sendable_count: run.final_sendable_count,
     final_rejected_count: run.final_rejected_count,
-    bv_credits_used: run.bv_credits_used,
+    mv_ok_count: run.mv_ok_count,
+    mv_catch_all_count: run.mv_catch_all_count,
+    mv_unknown_count: run.mv_unknown_count,
+    mv_invalid_count: run.mv_invalid_count,
+    mv_credits_used: mvCredits,
+    // Signature-compatible alias (Stage 1 is MillionVerifier now)
+    bv_credits_used: mvCredits,
     n2b_credits_used: run.n2b_credits_used,
     created_at: run.created_at,
     completed_at: run.completed_at,
@@ -57,12 +64,18 @@ export function createMcpServer() {
     },
     async ({ run_id }) => {
       const run = await getRun(run_id);
+      const mvCredits = run.mv_credits_used ?? 0;
       return textResult({
         status: run.status,
         total_emails: run.total_emails,
         final_sendable_count: run.final_sendable_count,
         final_rejected_count: run.final_rejected_count,
-        bv_credits_used: run.bv_credits_used,
+        mv_ok_count: run.mv_ok_count,
+        mv_catch_all_count: run.mv_catch_all_count,
+        mv_unknown_count: run.mv_unknown_count,
+        mv_invalid_count: run.mv_invalid_count,
+        mv_credits_used: mvCredits,
+        bv_credits_used: mvCredits,
         n2b_credits_used: run.n2b_credits_used,
       });
     }

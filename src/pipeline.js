@@ -6,8 +6,12 @@ import {
   getTodayCreditsUsed,
   updateRun,
 } from './db.js';
-import { verifyBatch } from './providers/billionverify.js';
-import { validateBulk } from './providers/no2bounce.js';
+import { getCredits, verifyBulk } from './providers/millionverifier.js';
+import {
+  isAcceptAllDeliverable,
+  isStrictDeliverable,
+  validateBulk,
+} from './providers/no2bounce.js';
 import {
   downloadFile,
   uploadFile,
@@ -45,11 +49,11 @@ async function runPipeline(runId) {
     if (!run) throw new Error('Run not found');
 
     await updateRun(runId, {
-      status: 'verifying_bv',
+      status: 'verifying_mv',
       started_at: new Date().toISOString(),
       error_message: null,
     });
-    await addLog(runId, 'Pipeline started');
+    await addLog(runId, 'Pipeline started (Stage 1 = MillionVerifier)');
 
     if (!run.upload_path) {
       throw new Error('Run has no upload_path');
@@ -62,13 +66,15 @@ async function runPipeline(runId) {
     await updateRun(runId, { total_emails: totalEmails });
     await addLog(runId, `Loaded ${totalEmails} rows from CSV (email column: ${emailCol})`);
 
-    // Credit ceiling check for BillionVerify
-    const bvUsedToday = await getTodayCreditsUsed('bv_credits_used');
-    const projectedBv = bvUsedToday + totalEmails;
-    if (projectedBv > config.bvDailyCreditCeiling) {
+    // Credit ceiling — MV balance: pause if projected usage > 50% of remaining
+    // Worst-case projection = all emails charged (ok/invalid only bill, but unknown beforehand)
+    const balance = await getCredits();
+    const projected = totalEmails;
+    const ceiling = Math.floor(balance.credits * config.mvBalanceFractionCeiling);
+    if (projected > ceiling) {
       const msg =
-        `BV credit ceiling pause: ${bvUsedToday} used today + ${totalEmails} projected = ${projectedBv} ` +
-        `(ceiling ${config.bvDailyCreditCeiling}). Not starting Stage 1.`;
+        `MillionVerifier credit ceiling pause: balance=${balance.credits}, ` +
+        `50% headroom=${ceiling}, projected worst-case=${projected}. Not starting Stage 1.`;
       await addLog(runId, `WARNING: ${msg}`);
       await updateRun(runId, {
         status: 'paused',
@@ -79,61 +85,35 @@ async function runPipeline(runId) {
 
     await addLog(
       runId,
-      `Credit check OK — BV today ${bvUsedToday}/${config.bvDailyCreditCeiling}; starting Stage 1 (BillionVerify)`
+      `Credit check OK — MV balance ${balance.credits} (50% ceiling ${ceiling}); starting Stage 1`
     );
 
-    // Stage 1 — BillionVerify
-    const bvResults = new Map();
-    let bvValid = 0;
-    let bvCatchall = 0;
-    let bvUnknown = 0;
-    let bvInvalid = 0;
-    let bvCredits = 0;
-    let processed = 0;
-    let lastLogAt = 0;
+    const emails = records
+      .map((r) => String(r[emailCol] || '').trim())
+      .filter(Boolean);
 
-    for (let i = 0; i < records.length; i += config.bvBatchSize) {
-      const batchRows = records.slice(i, i + config.bvBatchSize);
-      const emails = batchRows
-        .map((r) => String(r[emailCol] || '').trim())
-        .filter(Boolean);
+    const mv = await verifyBulk(emails, {
+      filename: `${sanitizeSegmentName(run.segment_name)}.csv`,
+      onProgress: async (message) => {
+        await addLog(runId, message);
+      },
+    });
 
-      const batchMap = await verifyBatch(emails);
-      for (const [email, result] of batchMap.entries()) {
-        bvResults.set(email, result);
-        bvCredits += result.credits_used || 0;
-        const status = result.status;
-        if (status === 'valid') bvValid += 1;
-        else if (status === 'catchall') bvCatchall += 1;
-        else if (status === 'unknown') bvUnknown += 1;
-        else bvInvalid += 1;
-      }
+    await updateRun(runId, {
+      mv_ok_count: mv.counts.ok,
+      mv_catch_all_count: mv.counts.catch_all,
+      mv_unknown_count: mv.counts.unknown,
+      mv_invalid_count: mv.counts.invalid,
+      mv_credits_used: mv.creditsUsed,
+      mv_file_id: mv.fileId,
+    });
 
-      processed += batchRows.length;
-      await updateRun(runId, {
-        bv_valid_count: bvValid,
-        bv_catchall_count: bvCatchall,
-        bv_unknown_count: bvUnknown,
-        bv_invalid_count: bvInvalid,
-        bv_credits_used: bvCredits,
-      });
-
-      if (processed - lastLogAt >= 500 || processed >= totalEmails) {
-        await addLog(
-          runId,
-          `BillionVerify progress: ${processed}/${totalEmails} ` +
-            `(valid=${bvValid}, catchall=${bvCatchall}, unknown=${bvUnknown}, invalid=${bvInvalid}, credits=${bvCredits})`
-        );
-        lastLogAt = processed;
-      }
-    }
-
-    // Stage 2 candidates
+    // Stage 2 candidates = catch_all + unknown
     const candidates = [];
     for (const row of records) {
       const email = String(row[emailCol] || '').trim().toLowerCase();
-      const bv = bvResults.get(email);
-      if (bv && (bv.status === 'unknown' || bv.status === 'catchall')) {
+      const result = mv.results.get(email)?.result;
+      if (result === 'catch_all' || result === 'unknown') {
         candidates.push(email);
       }
     }
@@ -144,7 +124,7 @@ async function runPipeline(runId) {
     });
     await addLog(
       runId,
-      `Stage 1 complete. Sending ${candidates.length} unknown/catchall emails to no2bounce`
+      `Stage 1 complete. Sending ${candidates.length} catch_all/unknown emails to no2bounce`
     );
 
     let n2bResults = new Map();
@@ -162,7 +142,7 @@ async function runPipeline(runId) {
         await updateRun(runId, {
           status: 'paused',
           error_message: msg,
-          bv_credits_used: bvCredits,
+          mv_credits_used: mv.creditsUsed,
           n2b_candidates_count: candidates.length,
         });
         return;
@@ -194,7 +174,7 @@ async function runPipeline(runId) {
         `no2bounce complete: deliverable=${n2bDeliverable}/${candidates.length}, credits=${n2bCredits}`
       );
     } else {
-      await addLog(runId, 'No unknown/catchall candidates — skipping no2bounce');
+      await addLog(runId, 'No catch_all/unknown candidates — skipping no2bounce');
     }
 
     // Merge
@@ -202,37 +182,57 @@ async function runPipeline(runId) {
     await addLog(runId, 'Merging results into SENDABLE / REJECTED CSVs');
 
     const outColumns = [
-      ...columns.filter((c) => c !== 'verification_source' && c !== 'verification_status'),
+      ...columns.filter(
+        (c) =>
+          c !== 'verification_source' &&
+          c !== 'verification_status' &&
+          c !== 'confidence'
+      ),
       'verification_source',
       'verification_status',
+      'confidence',
     ];
 
     const sendable = [];
     const rejected = [];
+    let confirmedCount = 0;
+    let unresolvedCatchallCount = 0;
 
     for (const row of records) {
       const email = String(row[emailCol] || '').trim().toLowerCase();
-      const bv = bvResults.get(email) || { status: 'unknown' };
+      const mvRow = mv.results.get(email) || { result: 'unknown' };
       const out = { ...row };
 
-      if (bv.status === 'valid') {
-        out.verification_source = 'billionverify';
-        out.verification_status = 'valid';
+      if (mvRow.result === 'ok') {
+        out.verification_source = 'millionverifier';
+        out.verification_status = 'ok';
+        out.confidence = 'confirmed';
         sendable.push(out);
-      } else if (bv.status === 'unknown' || bv.status === 'catchall') {
+        confirmedCount += 1;
+      } else if (mvRow.result === 'catch_all' || mvRow.result === 'unknown') {
         const n2b = n2bResults.get(email);
-        if (n2b?.deliverable) {
+        if (n2b && isStrictDeliverable(n2b.status)) {
           out.verification_source = 'no2bounce';
-          out.verification_status = 'deliverable';
+          out.verification_status = n2b.status;
+          out.confidence = 'confirmed';
           sendable.push(out);
+          confirmedCount += 1;
+        } else if (n2b && isAcceptAllDeliverable(n2b.status)) {
+          out.verification_source = 'no2bounce';
+          out.verification_status = n2b.status;
+          out.confidence = 'unresolved_catchall';
+          sendable.push(out);
+          unresolvedCatchallCount += 1;
         } else {
-          out.verification_source = n2b ? 'no2bounce' : 'billionverify';
-          out.verification_status = n2b?.status || bv.status;
+          out.verification_source = n2b ? 'no2bounce' : 'millionverifier';
+          out.verification_status = n2b?.status || mvRow.result;
+          out.confidence = 'rejected';
           rejected.push(out);
         }
       } else {
-        out.verification_source = 'billionverify';
-        out.verification_status = bv.status;
+        out.verification_source = 'millionverifier';
+        out.verification_status = mvRow.result;
+        out.confidence = 'rejected';
         rejected.push(out);
       }
     }
@@ -256,7 +256,7 @@ async function runPipeline(runId) {
       status: 'completed',
       final_sendable_count: sendable.length,
       final_rejected_count: rejected.length,
-      bv_credits_used: bvCredits,
+      mv_credits_used: mv.creditsUsed,
       n2b_credits_used: n2bCredits,
       n2b_deliverable_count: n2bDeliverable,
       sendable_path: sendablePath,
@@ -266,7 +266,7 @@ async function runPipeline(runId) {
 
     await addLog(
       runId,
-      `Completed — sendable=${sendable.length}, rejected=${rejected.length}`
+      `Completed — sendable=${sendable.length} (confirmed=${confirmedCount}, unresolved_catchall=${unresolvedCatchallCount}), rejected=${rejected.length}`
     );
   } catch (err) {
     const message = err?.message || String(err);
@@ -298,7 +298,6 @@ export async function startVerificationFromBuffer({
     totalEmails: records.length,
   });
 
-  // Prefer run-id namespaced path for clarity; keep original if rename fails
   const preferredPath = `${run.id}/${segment}.csv`;
   if (preferredPath !== uploadPath) {
     try {
