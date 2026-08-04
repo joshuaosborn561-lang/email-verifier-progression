@@ -60,3 +60,4 @@ Paused runs are logged and left in `paused` status (no service crash).
 - `GET /api/runs`
 - `GET /api/runs/:id`
 - `POST /api/upload` (multipart `files`)
+- `GET /export/bulk?run_ids=uuid1,uuid2` (also `/api/export/bulk`) — zip SENDABLE CSVs → signed URL

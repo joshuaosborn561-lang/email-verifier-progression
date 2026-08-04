@@ -9,6 +9,7 @@ import { startVerificationFromBuffer, enqueueRun } from './pipeline.js';
 import { createSignedUrl } from './storage.js';
 import { config } from './config.js';
 import { sanitizeSegmentName } from './csv.js';
+import { exportSendableZip } from './export.js';
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -94,6 +95,23 @@ export function createApiRouter() {
       res.json({ ok: true, run_id: run.id });
     } catch (err) {
       res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
+   * GET /api/export/bulk?run_ids=uuid1,uuid2
+   * Zips SENDABLE CSVs for completed runs → signed URL in verification-results.
+   */
+  router.get('/export/bulk', async (req, res) => {
+    try {
+      const result = await exportSendableZip(req.query.run_ids ?? req.query.run_id);
+      res.json(result);
+    } catch (err) {
+      const status = err.statusCode || 500;
+      res.status(status).json({
+        error: err.message,
+        ...(err.skipped ? { skipped: err.skipped } : {}),
+      });
     }
   });
 

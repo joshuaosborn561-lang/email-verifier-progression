@@ -8,6 +8,7 @@ import {
 import { startVerificationFromUrl } from './pipeline.js';
 import { createSignedUrl } from './storage.js';
 import { config } from './config.js';
+import { exportSendableZip } from './export.js';
 
 function summarizeRun(run) {
   const mvCredits = run.mv_credits_used ?? 0;
@@ -126,6 +127,39 @@ export function createMcpServer() {
         sendable_url,
         rejected_url,
       });
+    }
+  );
+
+  server.tool(
+    'export_all_sendable',
+    'Zip SENDABLE CSVs for multiple completed runs into one archive in verification-results and return a single signed download URL. Summary-only — never returns CSV row data.',
+    {
+      run_ids: z
+        .array(z.string().uuid())
+        .min(1)
+        .max(100)
+        .describe('Completed verification run IDs to include'),
+    },
+    async ({ run_ids }) => {
+      try {
+        const result = await exportSendableZip(run_ids);
+        return textResult({
+          download_url: result.download_url,
+          file_count: result.file_count,
+          total_sendable_rows: result.total_sendable_rows,
+          included: result.included.map((r) => ({
+            run_id: r.run_id,
+            segment_name: r.segment_name,
+            final_sendable_count: r.final_sendable_count,
+          })),
+          skipped: result.skipped,
+        });
+      } catch (err) {
+        return textResult({
+          error: err.message,
+          ...(err.skipped ? { skipped: err.skipped } : {}),
+        });
+      }
     }
   );
 
