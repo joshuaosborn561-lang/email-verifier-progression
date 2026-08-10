@@ -156,8 +156,8 @@ async function runN2bStage({
   await updateRun(runId, {
     status: 'verifying_n2b',
     n2b_candidates_count: totalCatchAllSubmitted + totalUnknownSubmitted,
-    n2b_catch_all_submitted: totalCatchAllSubmitted,
-    n2b_unknown_submitted: totalUnknownSubmitted,
+    n2b_catch_all_candidates: totalCatchAllSubmitted,
+    n2b_unknown_candidates: totalUnknownSubmitted,
     last_error: null,
   });
 
@@ -236,10 +236,10 @@ async function runN2bStage({
   await updateRun(runId, {
     n2b_deliverable_count: n2bDeliverable,
     n2b_credits_used: totalCredits,
-    n2b_catch_all_submitted: totalCatchAllSubmitted,
-    n2b_catch_all_confirmed: catchAllConfirmed,
-    n2b_unknown_submitted: totalUnknownSubmitted,
-    n2b_unknown_confirmed: unknownConfirmed,
+    n2b_catch_all_candidates: totalCatchAllSubmitted,
+    n2b_catch_all_deliverable: catchAllConfirmed,
+    n2b_unknown_candidates: totalUnknownSubmitted,
+    n2b_unknown_deliverable: unknownConfirmed,
     stage_completed: 'n2b',
   });
 
@@ -632,10 +632,10 @@ export async function buildResultsPayload(run) {
     mv_invalid_count: run.mv_invalid_count ?? 0,
     n2b_candidates_count: run.n2b_candidates_count ?? 0,
     n2b_deliverable_count: run.n2b_deliverable_count ?? 0,
-    n2b_catch_all_submitted: run.n2b_catch_all_submitted ?? 0,
-    n2b_catch_all_confirmed: run.n2b_catch_all_confirmed ?? 0,
-    n2b_unknown_submitted: run.n2b_unknown_submitted ?? 0,
-    n2b_unknown_confirmed: run.n2b_unknown_confirmed ?? 0,
+    n2b_catch_all_candidates: run.n2b_catch_all_candidates ?? 0,
+    n2b_catch_all_deliverable: run.n2b_catch_all_deliverable ?? 0,
+    n2b_unknown_candidates: run.n2b_unknown_candidates ?? 0,
+    n2b_unknown_deliverable: run.n2b_unknown_deliverable ?? 0,
     unresolved_after_n2b_count: run.unresolved_after_n2b_count ?? 0,
     mv_credits_used: run.mv_credits_used ?? 0,
     n2b_credits_used: run.n2b_credits_used ?? 0,

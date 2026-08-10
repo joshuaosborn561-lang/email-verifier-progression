@@ -12,10 +12,10 @@ alter table verification_runs
   add column if not exists last_error text,
   add column if not exists retry_count int default 0,
   add column if not exists stage_completed text default 'none',
-  add column if not exists n2b_catch_all_submitted int default 0,
-  add column if not exists n2b_catch_all_confirmed int default 0,
-  add column if not exists n2b_unknown_submitted int default 0,
-  add column if not exists n2b_unknown_confirmed int default 0,
+  add column if not exists n2b_catch_all_candidates int default 0,
+  add column if not exists n2b_catch_all_deliverable int default 0,
+  add column if not exists n2b_unknown_candidates int default 0,
+  add column if not exists n2b_unknown_deliverable int default 0,
   add column if not exists unresolved_after_n2b_count int default 0;
 
 comment on column verification_runs.stage_completed is
