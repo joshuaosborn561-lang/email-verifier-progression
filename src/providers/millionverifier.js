@@ -88,6 +88,88 @@ function parseMvCsv(csvText) {
 }
 
 /**
+ * Resolve CSV text from a download response body.
+ * Honors the same split as millionverifier-mcp (~350k chars):
+ * - delivery=inline → use envelope.csv
+ * - delivery=url → fetch envelope.download_url (signed)
+ * - raw octet-stream / CSV body → use as-is
+ */
+export async function resolveDownloadCsv(bodyText, contentType = '', { onProgress, fileId, fetchImpl = fetch } = {}) {
+  const ct = String(contentType || '').toLowerCase();
+  if (ct.includes('application/json') || bodyText.trimStart().startsWith('{')) {
+    let envelope;
+    try {
+      envelope = JSON.parse(bodyText);
+    } catch {
+      return { csvText: bodyText, delivery: 'raw' };
+    }
+
+    if (envelope?.error) {
+      throw new VendorError(
+        envelope.error || envelope.message || 'MillionVerifier download error',
+        { vendor: 'millionverifier' }
+      );
+    }
+
+    const delivery = String(envelope.delivery || '').toLowerCase();
+    const signedUrl =
+      envelope.download_url ||
+      envelope.signed_url ||
+      envelope.url ||
+      envelope.result?.download_url ||
+      null;
+    const inlineCsv = envelope.csv || envelope.data || envelope.content || null;
+
+    if (delivery === 'url' || (signedUrl && !inlineCsv)) {
+      if (!signedUrl) {
+        throw new VendorError(
+          'MillionVerifier download returned delivery=url but no download_url',
+          { vendor: 'millionverifier' }
+        );
+      }
+      if (onProgress) {
+        await onProgress(
+          `MillionVerifier file_id=${fileId}: following signed download_url (delivery=url, total_chars=${envelope.total_chars ?? 'n/a'})`
+        );
+      }
+      const signedRes = await fetchImpl(signedUrl);
+      if (!signedRes.ok) {
+        throw new VendorError(
+          `MillionVerifier signed URL download HTTP ${signedRes.status}`,
+          { status: signedRes.status, transient: signedRes.status >= 500, vendor: 'millionverifier' }
+        );
+      }
+      return { csvText: await signedRes.text(), delivery: 'url' };
+    }
+
+    if (delivery === 'inline' || typeof inlineCsv === 'string') {
+      if (typeof inlineCsv !== 'string' || !inlineCsv.length) {
+        throw new VendorError(
+          'MillionVerifier download returned delivery=inline but empty csv',
+          { vendor: 'millionverifier' }
+        );
+      }
+      if (onProgress) {
+        await onProgress(
+          `MillionVerifier file_id=${fileId}: using inline csv (delivery=inline, chars=${inlineCsv.length})`
+        );
+      }
+      return { csvText: inlineCsv, delivery: 'inline' };
+    }
+
+    if (bodyText.includes('\n') && /email/i.test(bodyText.slice(0, 200))) {
+      return { csvText: bodyText, delivery: 'raw' };
+    }
+    throw new VendorError(
+      `MillionVerifier download returned unrecognized JSON (keys: ${Object.keys(envelope).join(',')})`,
+      { vendor: 'millionverifier' }
+    );
+  }
+
+  return { csvText: bodyText, delivery: 'raw' };
+}
+
+/**
  * Download + parse results for an existing MillionVerifier file_id (no re-upload / no re-charge).
  */
 export async function downloadResultsByFileId(fileId, { onProgress } = {}) {
@@ -152,7 +234,13 @@ export async function downloadResultsByFileId(fileId, { onProgress } = {}) {
         { status: dlRes.status, vendor: 'millionverifier' }
       );
     }
-    return dlRes.text();
+    const contentType = String(dlRes.headers.get('content-type') || '');
+    const bodyText = await dlRes.text();
+    const resolved = await resolveDownloadCsv(bodyText, contentType, {
+      onProgress,
+      fileId,
+    });
+    return resolved.csvText;
   });
 
   const { results, counts } = parseMvCsv(csvText);

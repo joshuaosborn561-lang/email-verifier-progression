@@ -105,7 +105,8 @@ export function createApiRouter() {
 
   router.post('/runs/:id/resume', async (req, res) => {
     try {
-      const run = await resumeVerification(req.params.id);
+      const force = req.query.force === '1' || req.body?.force === true;
+      const run = await resumeVerification(req.params.id, { force });
       res.json({
         ok: true,
         run_id: run.id,
