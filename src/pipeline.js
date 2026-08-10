@@ -49,8 +49,8 @@ async function failRun(runId, message, extra = {}) {
 }
 
 function buildAddressRowsFromMv(emails, mvResults) {
-  return emails.map((email) => {
-    const key = email.toLowerCase();
+  const unique = [...new Set(emails.map((e) => String(e).trim().toLowerCase()).filter(Boolean))];
+  return unique.map((key) => {
     const mv = mvResults.get(key)?.result || 'unknown';
     const cohort = mv === 'catch_all' || mv === 'unknown' ? mv : null;
     const outcome = resolveAddressOutcome(mv, null);

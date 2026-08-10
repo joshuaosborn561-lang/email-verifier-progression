@@ -110,17 +110,24 @@ export async function upsertAddressResults(runId, rows) {
   if (!rows.length) return;
   const supabase = getSupabase();
   const now = new Date().toISOString();
-  const payload = rows.map((row) => ({
-    run_id: runId,
-    email: String(row.email).toLowerCase(),
-    mv_result: row.mv_result ?? null,
-    n2b_status: row.n2b_status ?? null,
-    n2b_cohort: row.n2b_cohort ?? null,
-    final_disposition: row.final_disposition ?? 'pending',
-    confidence: row.confidence ?? null,
-    verification_source: row.verification_source ?? null,
-    updated_at: now,
-  }));
+  // Dedupe by email — Postgres rejects ON CONFLICT when the same key appears twice in one statement
+  const byEmail = new Map();
+  for (const row of rows) {
+    const email = String(row.email || '').trim().toLowerCase();
+    if (!email) continue;
+    byEmail.set(email, {
+      run_id: runId,
+      email,
+      mv_result: row.mv_result ?? null,
+      n2b_status: row.n2b_status ?? null,
+      n2b_cohort: row.n2b_cohort ?? null,
+      final_disposition: row.final_disposition ?? 'pending',
+      confidence: row.confidence ?? null,
+      verification_source: row.verification_source ?? null,
+      updated_at: now,
+    });
+  }
+  const payload = [...byEmail.values()];
 
   const chunkSize = 500;
   for (let i = 0; i < payload.length; i += chunkSize) {
