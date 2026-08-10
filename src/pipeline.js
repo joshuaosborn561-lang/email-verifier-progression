@@ -385,10 +385,23 @@ export async function runPipeline(runId, { resume = false } = {}) {
           (Number(run.mv_invalid_count) || 0),
         emails.length
       );
-      // Partial upserts from a prior crash leave incomplete rows — reload from MV file
+      const tallies = { ok: 0, catch_all: 0, unknown: 0, invalid: 0 };
+      for (const row of addressRows) {
+        if (tallies[row.mv_result] !== undefined) tallies[row.mv_result] += 1;
+      }
+      const tallyClose = (got, expected) => {
+        const exp = Number(expected) || 0;
+        if (exp === 0) return got === 0;
+        return Math.abs(got - exp) <= Math.max(25, Math.floor(exp * 0.05));
+      };
+      // Partial upserts OR truncated MV reloads leave wrong classifications — reload from MV file
       const coverageOk =
         addressRows.length > 0 &&
-        addressRows.length >= Math.floor(expectedMvRows * 0.95);
+        addressRows.length >= Math.floor(expectedMvRows * 0.95) &&
+        tallyClose(tallies.ok, run.mv_ok_count) &&
+        tallyClose(tallies.catch_all, run.mv_catch_all_count) &&
+        tallyClose(tallies.unknown, run.mv_unknown_count) &&
+        tallyClose(tallies.invalid, run.mv_invalid_count);
 
       if (coverageOk) {
         mvResults = mvMapFromAddressRows(addressRows);
@@ -586,11 +599,14 @@ export async function runPipeline(runId, { resume = false } = {}) {
   }
 }
 
-export async function resumeVerification(runId) {
+export async function resumeVerification(runId, { force = false } = {}) {
   const { getRun } = await import('./db.js');
   const run = await getRun(runId);
   if (!run) throw new Error('Run not found');
-  if (!['failed', 'paused', 'queued'].includes(run.status)) {
+  const resumable = ['failed', 'paused', 'queued'];
+  if (force && run.status === 'completed') {
+    // allow repair of completed-but-corrupt runs
+  } else if (!resumable.includes(run.status)) {
     throw new Error(`Cannot resume run in status ${run.status}`);
   }
 

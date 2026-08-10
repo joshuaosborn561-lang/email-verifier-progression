@@ -162,12 +162,22 @@ export async function downloadResultsByFileId(fileId, { onProgress } = {}) {
     unknown: Number(fileinfo.unknown ?? counts.unknown),
     invalid: Number(fileinfo.invalid ?? counts.invalid),
   };
+  const fileinfoTotal =
+    mergedCounts.ok + mergedCounts.catch_all + mergedCounts.unknown + mergedCounts.invalid;
+  // Truncated downloads (common under concurrent fetch) must not be treated as full results
+  if (fileinfoTotal > 0 && results.size < Math.floor(fileinfoTotal * 0.95)) {
+    throw new VendorError(
+      `MillionVerifier download incomplete for file_id=${fileId}: parsed ${results.size} rows vs fileinfo total ${fileinfoTotal} (csv bytes=${csvText.length})`,
+      { transient: true, vendor: 'millionverifier' }
+    );
+  }
+
   const creditsUsed = computeMvCreditsUsed(fileinfo, mergedCounts);
 
   if (onProgress) {
     await onProgress(
       `MillionVerifier loaded file_id=${fileId}: ok=${mergedCounts.ok}, catch_all=${mergedCounts.catch_all}, ` +
-        `unknown=${mergedCounts.unknown}, invalid=${mergedCounts.invalid}, credits_used=${creditsUsed}`
+        `unknown=${mergedCounts.unknown}, invalid=${mergedCounts.invalid}, parsed=${results.size}, credits_used=${creditsUsed}`
     );
   }
 
