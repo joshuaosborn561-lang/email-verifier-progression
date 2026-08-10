@@ -377,23 +377,60 @@ export async function runPipeline(runId, { resume = false } = {}) {
       );
 
       addressRows = await listAddressResults(runId);
-      if (addressRows.length > 0) {
+      const expectedMvRows = Math.max(
+        Number(run.total_emails) || 0,
+        (Number(run.mv_ok_count) || 0) +
+          (Number(run.mv_catch_all_count) || 0) +
+          (Number(run.mv_unknown_count) || 0) +
+          (Number(run.mv_invalid_count) || 0),
+        emails.length
+      );
+      // Partial upserts from a prior crash leave incomplete rows — reload from MV file
+      const coverageOk =
+        addressRows.length > 0 &&
+        addressRows.length >= Math.floor(expectedMvRows * 0.95);
+
+      if (coverageOk) {
         mvResults = mvMapFromAddressRows(addressRows);
+        await addLog(
+          runId,
+          `Resume: using ${addressRows.length} persisted address rows (expected ≈ ${expectedMvRows})`
+        );
       } else if (run.mv_file_id) {
         await updateRun(runId, { status: 'verifying_mv' });
+        await addLog(
+          runId,
+          `Resume: address coverage incomplete (${addressRows.length}/${expectedMvRows}) — reloading MillionVerifier file_id=${run.mv_file_id} (no re-charge)`
+        );
         const mv = await downloadResultsByFileId(run.mv_file_id, {
           onProgress: async (message) => addLog(runId, message),
         });
         mvResults = mv.results;
         mvCredits = mv.creditsUsed;
         addressRows = buildAddressRowsFromMv(emails, mvResults);
+        // Preserve any N2B fields already written for overlapping emails
+        const priorByEmail = new Map(
+          (await listAddressResults(runId)).map((r) => [r.email, r])
+        );
+        addressRows = addressRows.map((row) => {
+          const prior = priorByEmail.get(row.email);
+          if (!prior?.n2b_status) return row;
+          return {
+            ...row,
+            n2b_status: prior.n2b_status,
+            n2b_cohort: prior.n2b_cohort || row.n2b_cohort,
+            final_disposition: prior.final_disposition || row.final_disposition,
+            confidence: prior.confidence || row.confidence,
+            verification_source: prior.verification_source || row.verification_source,
+          };
+        });
         await upsertAddressResults(runId, addressRows);
         await updateRun(runId, {
           mv_ok_count: mv.counts.ok,
           mv_catch_all_count: mv.counts.catch_all,
           mv_unknown_count: mv.counts.unknown,
           mv_invalid_count: mv.counts.invalid,
-          mv_credits_used: mvCredits,
+          mv_credits_used: mvCredits || run.mv_credits_used,
           mv_file_id: mv.fileId,
           stage_completed: 'mv',
         });
