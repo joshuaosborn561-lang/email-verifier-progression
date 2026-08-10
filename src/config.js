@@ -24,14 +24,14 @@ export const config = {
   get millionVerifierApiKey() {
     return required('MILLIONVERIFIER_API_KEY');
   },
-  // Kept for backward compatibility; no longer used by the pipeline
-  get billionVerifyApiKey() {
-    return process.env.BILLIONVERIFY_API_KEY || '';
-  },
   get no2bounceApiToken() {
     return required('NO2BOUNCE_API_TOKEN');
   },
   n2bDailyCreditCeiling: 19_000,
+  /** No2Bounce submit batch size — large payloads (~1000+) trigger vendor 500s. */
+  n2bSubmitBatchSize: Number(process.env.N2B_SUBMIT_BATCH_SIZE || 150),
+  vendorMaxAttempts: Number(process.env.VENDOR_MAX_ATTEMPTS || 5),
+  vendorRetryBaseMs: Number(process.env.VENDOR_RETRY_BASE_MS || 2_000),
   mvBalanceFractionCeiling: 0.5, // pause if projected usage > 50% of remaining MV credits
   uploadsBucket: 'verification-uploads',
   resultsBucket: 'verification-results',

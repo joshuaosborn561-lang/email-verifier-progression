@@ -63,7 +63,7 @@ function renderRuns() {
         <td>${run.total_emails ?? '—'}</td>
         <td>${run.final_sendable_count ?? '—'}</td>
         <td>${run.final_rejected_count ?? '—'}</td>
-        <td>${run.mv_credits_used ?? run.bv_credits_used ?? 0}</td>
+        <td>${run.mv_credits_used ?? 0}</td>
         <td>${run.n2b_credits_used ?? 0}</td>
         <td>${formatTs(run.created_at)}</td>
       </tr>`
@@ -101,13 +101,39 @@ async function fetchDetail(id) {
       <span>${run.total_emails ?? 0} emails</span>
       <span>sendable ${run.final_sendable_count ?? 0}</span>
       <span>rejected ${run.final_rejected_count ?? 0}</span>
-      <span>MV ${run.mv_credits_used ?? run.bv_credits_used ?? 0} · N2B ${run.n2b_credits_used ?? 0}</span>
+      <span>MV ${run.mv_credits_used ?? 0} · N2B ${run.n2b_credits_used ?? 0}</span>
       ${run.mv_ok_count != null ? `<span>ok ${run.mv_ok_count} · catch_all ${run.mv_catch_all_count ?? 0} · unknown ${run.mv_unknown_count ?? 0} · invalid ${run.mv_invalid_count ?? 0}</span>` : ''}
+      ${run.stage_completed ? `<span>stage ${escapeHtml(run.stage_completed)}</span>` : ''}
       <span>created ${formatTs(run.created_at)}</span>
       ${run.completed_at ? `<span>completed ${formatTs(run.completed_at)}</span>` : ''}
     </div>
-    ${run.error_message ? `<p class="muted">${escapeHtml(run.error_message)}</p>` : ''}
+    ${
+      run.last_error || run.error_message
+        ? `<p class="muted">${escapeHtml(run.last_error || run.error_message)}</p>`
+        : ''
+    }
+    ${
+      ['failed', 'paused'].includes(run.status)
+        ? `<p><button type="button" id="resume-btn" data-id="${run.id}">Resume from last stage</button></p>`
+        : ''
+    }
   `;
+
+  const resumeBtn = document.getElementById('resume-btn');
+  if (resumeBtn) {
+    resumeBtn.onclick = async () => {
+      resumeBtn.disabled = true;
+      try {
+        const r = await fetch(`/api/runs/${run.id}/resume`, { method: 'POST' });
+        const body = await r.json();
+        if (!r.ok) throw new Error(body.error || 'Resume failed');
+        await fetchDetail(run.id);
+      } catch (err) {
+        alert(err.message);
+        resumeBtn.disabled = false;
+      }
+    };
+  }
 
   if (data.downloads) {
     els.detailDownloads.hidden = false;

@@ -5,13 +5,13 @@ import {
   getRun,
   listRuns,
 } from './db.js';
-import { startVerificationFromUrl } from './pipeline.js';
-import { createSignedUrl } from './storage.js';
-import { config } from './config.js';
-import { exportSendableZip } from './export.js';
+import {
+  buildResultsPayload,
+  resumeVerification,
+  startVerificationFromUrl,
+} from './pipeline.js';
 
 function summarizeRun(run) {
-  const mvCredits = run.mv_credits_used ?? 0;
   return {
     run_id: run.id,
     segment_name: run.segment_name,
@@ -23,10 +23,16 @@ function summarizeRun(run) {
     mv_catch_all_count: run.mv_catch_all_count,
     mv_unknown_count: run.mv_unknown_count,
     mv_invalid_count: run.mv_invalid_count,
-    mv_credits_used: mvCredits,
-    // Signature-compatible alias (Stage 1 is MillionVerifier now)
-    bv_credits_used: mvCredits,
+    mv_credits_used: run.mv_credits_used ?? 0,
     n2b_credits_used: run.n2b_credits_used,
+    n2b_catch_all_submitted: run.n2b_catch_all_submitted ?? 0,
+    n2b_catch_all_confirmed: run.n2b_catch_all_confirmed ?? 0,
+    n2b_unknown_submitted: run.n2b_unknown_submitted ?? 0,
+    n2b_unknown_confirmed: run.n2b_unknown_confirmed ?? 0,
+    unresolved_after_n2b_count: run.unresolved_after_n2b_count ?? 0,
+    stage_completed: run.stage_completed || 'none',
+    last_error: run.last_error || run.error_message || null,
+    retry_count: run.retry_count ?? 0,
     created_at: run.created_at,
     completed_at: run.completed_at,
   };
@@ -41,7 +47,7 @@ function textResult(obj) {
 export function createMcpServer() {
   const server = new McpServer({
     name: 'email-verification-waterfall',
-    version: '1.0.0',
+    version: '1.1.0',
   });
 
   server.tool(
@@ -65,7 +71,6 @@ export function createMcpServer() {
     },
     async ({ run_id }) => {
       const run = await getRun(run_id);
-      const mvCredits = run.mv_credits_used ?? 0;
       return textResult({
         status: run.status,
         total_emails: run.total_emails,
@@ -75,9 +80,16 @@ export function createMcpServer() {
         mv_catch_all_count: run.mv_catch_all_count,
         mv_unknown_count: run.mv_unknown_count,
         mv_invalid_count: run.mv_invalid_count,
-        mv_credits_used: mvCredits,
-        bv_credits_used: mvCredits,
+        mv_credits_used: run.mv_credits_used ?? 0,
         n2b_credits_used: run.n2b_credits_used,
+        n2b_catch_all_submitted: run.n2b_catch_all_submitted ?? 0,
+        n2b_catch_all_confirmed: run.n2b_catch_all_confirmed ?? 0,
+        n2b_unknown_submitted: run.n2b_unknown_submitted ?? 0,
+        n2b_unknown_confirmed: run.n2b_unknown_confirmed ?? 0,
+        unresolved_after_n2b_count: run.unresolved_after_n2b_count ?? 0,
+        stage_completed: run.stage_completed || 'none',
+        last_error: run.last_error || run.error_message || null,
+        retry_count: run.retry_count ?? 0,
       });
     }
   );
@@ -98,35 +110,35 @@ export function createMcpServer() {
 
   server.tool(
     'get_verification_results',
-    'Once a run is completed, return signed download URLs for SENDABLE and REJECTED CSVs. Summary-only — no row data.',
+    'Return SENDABLE/REJECTED download URLs and stage counts. Completed runs return full results; failed/paused/in-progress runs return partial results labeled as such.',
     {
       run_id: z.string().uuid(),
     },
     async ({ run_id }) => {
       const run = await getRun(run_id);
-      if (run.status !== 'completed') {
+      const payload = await buildResultsPayload(run);
+      return textResult(payload);
+    }
+  );
+
+  server.tool(
+    'resume_verification',
+    'Resume a failed or paused verification run from the last completed stage. Does not re-run MillionVerifier when mv results or mv_file_id are already available.',
+    {
+      run_id: z.string().uuid(),
+    },
+    async ({ run_id }) => {
+      try {
+        const run = await resumeVerification(run_id);
         return textResult({
-          error: 'Run is not completed',
+          run_id: run.id,
           status: run.status,
+          stage_completed: run.stage_completed || 'none',
+          resumed: true,
         });
+      } catch (err) {
+        return textResult({ error: err.message, run_id });
       }
-      if (!run.sendable_path || !run.rejected_path) {
-        return textResult({ error: 'Result files missing for this run' });
-      }
-
-      const [sendable_url, rejected_url] = await Promise.all([
-        createSignedUrl(config.resultsBucket, run.sendable_path),
-        createSignedUrl(config.resultsBucket, run.rejected_path),
-      ]);
-
-      return textResult({
-        run_id: run.id,
-        status: run.status,
-        final_sendable_count: run.final_sendable_count,
-        final_rejected_count: run.final_rejected_count,
-        sendable_url,
-        rejected_url,
-      });
     }
   );
 
@@ -142,6 +154,7 @@ export function createMcpServer() {
     },
     async ({ run_ids }) => {
       try {
+        const { exportSendableZip } = await import('./export.js');
         const result = await exportSendableZip(run_ids);
         return textResult({
           download_url: result.download_url,

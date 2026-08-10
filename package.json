@@ -1,12 +1,13 @@
 {
   "name": "email-verification-waterfall",
   "version": "1.0.0",
-  "description": "Email verification waterfall dashboard + MCP server (BillionVerify → no2bounce)",
+  "description": "Email verification waterfall dashboard + MCP (MillionVerifier → no2bounce)",
   "type": "module",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "dev": "node --watch src/server.js",
+    "test": "node --test tests/*.test.js"
   },
   "engines": {
     "node": ">=20"

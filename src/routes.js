@@ -5,7 +5,11 @@ import {
   getRunLogs,
   listRuns,
 } from './db.js';
-import { startVerificationFromBuffer, enqueueRun } from './pipeline.js';
+import {
+  startVerificationFromBuffer,
+  resumeVerification,
+  buildResultsPayload,
+} from './pipeline.js';
 import { createSignedUrl } from './storage.js';
 import { config } from './config.js';
 import { sanitizeSegmentName } from './csv.js';
@@ -87,14 +91,39 @@ export function createApiRouter() {
 
   router.post('/runs/:id/retry', async (req, res) => {
     try {
-      const run = await getRun(req.params.id);
-      if (!['failed', 'paused', 'queued'].includes(run.status)) {
-        return res.status(400).json({ error: `Cannot retry run in status ${run.status}` });
-      }
-      enqueueRun(run.id);
-      res.json({ ok: true, run_id: run.id });
+      const run = await resumeVerification(req.params.id);
+      res.json({
+        ok: true,
+        run_id: run.id,
+        status: run.status,
+        stage_completed: run.stage_completed || 'none',
+      });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  router.post('/runs/:id/resume', async (req, res) => {
+    try {
+      const run = await resumeVerification(req.params.id);
+      res.json({
+        ok: true,
+        run_id: run.id,
+        status: run.status,
+        stage_completed: run.stage_completed || 'none',
+      });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  router.get('/runs/:id/results', async (req, res) => {
+    try {
+      const run = await getRun(req.params.id);
+      const payload = await buildResultsPayload(run);
+      res.json(payload);
+    } catch (err) {
+      res.status(404).json({ error: err.message });
     }
   });
 
