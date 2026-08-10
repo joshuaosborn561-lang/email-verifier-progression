@@ -58,10 +58,12 @@ Per-address MillionVerifier results are persisted before No2Bounce starts. Faile
 
 ## Credit ceilings
 
-- MillionVerifier: pause if projected worst-case usage > **50% of remaining balance**
-- no2bounce: pause if today's usage + projected > **19,000**
+Credit-ceiling pauses are **disabled by default** so every `start_verification` run completes the full waterfall (MV → No2Bounce → merge). Optional env overrides:
 
-Paused runs are logged and left in `paused` status (no service crash). `mv_credits_used` is sourced from MillionVerifier file tallies (`ok + invalid`); `n2b_credits_used` from No2Bounce `creditDebited`.
+- `MV_BALANCE_FRACTION_CEILING` — e.g. `0.5` to pause before Stage 1 if projected usage exceeds that fraction of remaining MV balance
+- `N2B_DAILY_CREDIT_CEILING` — e.g. `19000` to pause before Stage 2 if today's N2B usage + candidates would exceed it
+
+`mv_credits_used` is sourced from MillionVerifier file tallies (`ok + invalid`); `n2b_credits_used` from No2Bounce `creditDebited`.
 
 ## API (dashboard)
 

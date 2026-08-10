@@ -173,26 +173,31 @@ async function runN2bStage({
   }
 
   const n2bUsedToday = await getTodayCreditsUsed('n2b_credits_used');
-  const projectedN2b = n2bUsedToday + candidates;
-  if (projectedN2b > config.n2bDailyCreditCeiling) {
-    const msg =
-      `no2bounce credit ceiling pause: ${n2bUsedToday} used today + ${candidates} candidates = ${projectedN2b} ` +
-      `(ceiling ${config.n2bDailyCreditCeiling}). Stopping before Stage 2.`;
-    await addLog(runId, `WARNING: ${msg}`);
-    await updateRun(runId, {
-      status: 'paused',
-      error_message: msg,
-      last_error: msg,
-      stage_completed: 'mv',
-      n2b_candidates_count: totalCatchAllSubmitted + totalUnknownSubmitted,
-    });
-    return { paused: true };
+  if (config.n2bDailyCreditCeiling > 0) {
+    const projectedN2b = n2bUsedToday + candidates;
+    if (projectedN2b > config.n2bDailyCreditCeiling) {
+      const msg =
+        `no2bounce credit ceiling pause: ${n2bUsedToday} used today + ${candidates} candidates = ${projectedN2b} ` +
+        `(ceiling ${config.n2bDailyCreditCeiling}). Stopping before Stage 2.`;
+      await addLog(runId, `WARNING: ${msg}`);
+      await updateRun(runId, {
+        status: 'paused',
+        error_message: msg,
+        last_error: msg,
+        stage_completed: 'mv',
+        n2b_candidates_count: totalCatchAllSubmitted + totalUnknownSubmitted,
+      });
+      return { paused: true };
+    }
   }
 
   await addLog(
     runId,
-    `Credit check OK — no2bounce today ${n2bUsedToday}/${config.n2bDailyCreditCeiling}; ` +
-      `submitting catch_all=${catchAllEmails.length}, unknown=${unknownEmails.length} as separate cohorts`
+    `Continuing full waterfall → no2bounce` +
+      (config.n2bDailyCreditCeiling > 0
+        ? ` (today ${n2bUsedToday}/${config.n2bDailyCreditCeiling})`
+        : ` (today ${n2bUsedToday} credits used; ceiling disabled)`) +
+      `; submitting catch_all=${catchAllEmails.length}, unknown=${unknownEmails.length} as separate cohorts`
   );
 
   let workingRows = addressRows;
@@ -457,26 +462,33 @@ export async function runPipeline(runId, { resume = false } = {}) {
       await addLog(runId, `Loaded ${totalEmails} rows from CSV (email column: ${emailCol})`);
 
       const balance = await getCredits();
-      const projected = totalEmails;
-      const ceiling = Math.floor(balance.credits * config.mvBalanceFractionCeiling);
-      if (projected > ceiling) {
-        const msg =
-          `MillionVerifier credit ceiling pause: balance=${balance.credits}, ` +
-          `50% headroom=${ceiling}, projected worst-case=${projected}. Not starting Stage 1.`;
-        await addLog(runId, `WARNING: ${msg}`);
-        await updateRun(runId, {
-          status: 'paused',
-          error_message: msg,
-          last_error: msg,
-          stage_completed: 'none',
-        });
-        return;
+      if (config.mvBalanceFractionCeiling > 0) {
+        const projected = totalEmails;
+        const ceiling = Math.floor(balance.credits * config.mvBalanceFractionCeiling);
+        if (projected > ceiling) {
+          const msg =
+            `MillionVerifier credit ceiling pause: balance=${balance.credits}, ` +
+            `${Math.round(config.mvBalanceFractionCeiling * 100)}% headroom=${ceiling}, ` +
+            `projected worst-case=${projected}. Not starting Stage 1.`;
+          await addLog(runId, `WARNING: ${msg}`);
+          await updateRun(runId, {
+            status: 'paused',
+            error_message: msg,
+            last_error: msg,
+            stage_completed: 'none',
+          });
+          return;
+        }
+        await addLog(
+          runId,
+          `Credit check OK — MV balance ${balance.credits} (ceiling ${ceiling}); starting full waterfall`
+        );
+      } else {
+        await addLog(
+          runId,
+          `Starting full waterfall — MV balance ${balance.credits} (credit ceilings disabled)`
+        );
       }
-
-      await addLog(
-        runId,
-        `Credit check OK — MV balance ${balance.credits} (50% ceiling ${ceiling}); starting Stage 1`
-      );
 
       const mv = await verifyBulk(emails, {
         filename: `${sanitizeSegmentName(run.segment_name)}.csv`,

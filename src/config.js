@@ -27,12 +27,16 @@ export const config = {
   get no2bounceApiToken() {
     return required('NO2BOUNCE_API_TOKEN');
   },
-  n2bDailyCreditCeiling: 19_000,
+  /**
+   * Optional soft ceilings. Default 0 = disabled (always run the full waterfall).
+   * Set N2B_DAILY_CREDIT_CEILING / MV_BALANCE_FRACTION_CEILING env vars to re-enable pauses.
+   */
+  n2bDailyCreditCeiling: Number(process.env.N2B_DAILY_CREDIT_CEILING || 0),
   /** No2Bounce submit batch size — large payloads (~1000+) trigger vendor 500s. */
   n2bSubmitBatchSize: Number(process.env.N2B_SUBMIT_BATCH_SIZE || 150),
   vendorMaxAttempts: Number(process.env.VENDOR_MAX_ATTEMPTS || 5),
   vendorRetryBaseMs: Number(process.env.VENDOR_RETRY_BASE_MS || 2_000),
-  mvBalanceFractionCeiling: 0.5, // pause if projected usage > 50% of remaining MV credits
+  mvBalanceFractionCeiling: Number(process.env.MV_BALANCE_FRACTION_CEILING || 0),
   uploadsBucket: 'verification-uploads',
   resultsBucket: 'verification-results',
   millionVerifierBulkUrl: 'https://bulkapi.millionverifier.com/bulkapi/v2',

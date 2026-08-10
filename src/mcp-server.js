@@ -52,14 +52,29 @@ export function createMcpServer() {
 
   server.tool(
     'start_verification',
-    'Start an email verification waterfall run from a CSV file URL. Returns immediately with run_id — does not wait for completion. Never returns per-email results.',
+    [
+      'Start a FULL email verification waterfall from a CSV file URL.',
+      'Always runs end-to-end: (1) MillionVerifier classifies ok/catch_all/unknown/invalid,',
+      '(2) catch_all AND unknown are sent to No2Bounce,',
+      '(3) final SENDABLE = MV ok + No2Bounce-confirmed catch_alls + No2Bounce-confirmed unknowns;',
+      'final REJECTED = MV invalid + No2Bounce rejects / unresolved.',
+      'Does NOT stop after MillionVerifier.',
+      'Returns immediately with run_id — poll get_verification_status until status=completed, then get_verification_results for the final files.',
+      'Never returns per-email results.',
+    ].join(' '),
     {
       file_url: z.string().url().describe('Publicly accessible URL to a CSV with an Email column'),
       segment_name: z.string().min(1).describe('Segment / list name for this run'),
     },
     async ({ file_url, segment_name }) => {
       const run = await startVerificationFromUrl(file_url, segment_name);
-      return textResult({ run_id: run.id, status: run.status, segment_name: run.segment_name });
+      return textResult({
+        run_id: run.id,
+        status: run.status,
+        segment_name: run.segment_name,
+        waterfall: 'millionverifier -> no2bounce(catch_all+unknown) -> merge sendable/rejected',
+        note: 'Pipeline continues automatically through No2Bounce and final merge. Poll until status=completed.',
+      });
     }
   );
 
