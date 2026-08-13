@@ -37,6 +37,12 @@ export const config = {
   vendorMaxAttempts: Number(process.env.VENDOR_MAX_ATTEMPTS || 5),
   vendorRetryBaseMs: Number(process.env.VENDOR_RETRY_BASE_MS || 2_000),
   mvBalanceFractionCeiling: Number(process.env.MV_BALANCE_FRACTION_CEILING || 0),
+  /** Max time for a MillionVerifier job to reach finished (default 45m). */
+  mvStageTimeoutMs: Number(process.env.MV_STAGE_TIMEOUT_MS || 45 * 60 * 1000),
+  /** Fail if percent/verified make no progress for this long (default 12m). */
+  mvStallTimeoutMs: Number(process.env.MV_STALL_TIMEOUT_MS || 12 * 60 * 1000),
+  /** Max time for a No2Bounce cohort batch poll (default 45m). */
+  n2bStageTimeoutMs: Number(process.env.N2B_STAGE_TIMEOUT_MS || 45 * 60 * 1000),
   uploadsBucket: 'verification-uploads',
   resultsBucket: 'verification-results',
   millionVerifierBulkUrl: 'https://bulkapi.millionverifier.com/bulkapi/v2',

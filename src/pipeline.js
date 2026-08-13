@@ -22,27 +22,54 @@ import {
 } from './storage.js';
 
 const activeJobs = new Set();
+const runAbortControllers = new Map();
 
 export function enqueueRun(runId, { resume = false } = {}) {
-  if (activeJobs.has(runId)) return;
-  activeJobs.add(runId);
-  setImmediate(() => {
-    runPipeline(runId, { resume })
+  const previous = runAbortControllers.get(runId);
+  if (previous) {
+    previous.abort();
+  }
+
+  const ac = new AbortController();
+  runAbortControllers.set(runId, ac);
+
+  const start = () => {
+    if (ac.signal.aborted) {
+      if (runAbortControllers.get(runId) === ac) runAbortControllers.delete(runId);
+      return;
+    }
+    if (activeJobs.has(runId)) {
+      // Prior attempt is exiting after abort — retry shortly
+      setTimeout(start, 500);
+      return;
+    }
+    activeJobs.add(runId);
+    runPipeline(runId, { resume, signal: ac.signal })
       .catch((err) => {
         console.error(`Pipeline crashed for ${runId}:`, err);
       })
       .finally(() => {
         activeJobs.delete(runId);
+        if (runAbortControllers.get(runId) === ac) {
+          runAbortControllers.delete(runId);
+        }
       });
-  });
+  };
+
+  setImmediate(start);
 }
 
 async function failRun(runId, message, extra = {}) {
-  await addLog(runId, `ERROR: ${message}`);
+  const text = String(message || 'Unknown pipeline error');
+  try {
+    await addLog(runId, `ERROR: ${text}`);
+  } catch (logErr) {
+    console.error(`Failed to append error log for ${runId}:`, logErr);
+  }
   await updateRun(runId, {
     status: 'failed',
-    error_message: message,
-    last_error: message,
+    error_message: text,
+    last_error: text,
     completed_at: new Date().toISOString(),
     ...extra,
   });
@@ -336,14 +363,16 @@ async function runMergeStage({
  * - stage mv (or mv_file_id present) → skip MV, run N2B on pending cohorts
  * - stage n2b → skip to merge
  */
-export async function runPipeline(runId, { resume = false } = {}) {
+export async function runPipeline(runId, { resume = false, signal } = {}) {
   let stageCompleted = 'none';
+  let mvFileId = null;
   try {
     const { getRun } = await import('./db.js');
     let run = await getRun(runId);
     if (!run) throw new Error('Run not found');
 
     stageCompleted = run.stage_completed || 'none';
+    mvFileId = run.mv_file_id || null;
     const canSkipMv =
       resume &&
       (stageCompleted === 'mv' ||
@@ -415,16 +444,18 @@ export async function runPipeline(runId, { resume = false } = {}) {
           `Resume: using ${addressRows.length} persisted address rows (expected ≈ ${expectedMvRows})`
         );
       } else if (run.mv_file_id) {
-        await updateRun(runId, { status: 'verifying_mv' });
+        await updateRun(runId, { status: 'verifying_mv', last_error: null });
         await addLog(
           runId,
           `Resume: address coverage incomplete (${addressRows.length}/${expectedMvRows}) — reloading MillionVerifier file_id=${run.mv_file_id} (no re-charge)`
         );
         const mv = await downloadResultsByFileId(run.mv_file_id, {
           onProgress: async (message) => addLog(runId, message),
+          signal,
         });
         mvResults = mv.results;
         mvCredits = mv.creditsUsed;
+        mvFileId = mv.fileId;
         addressRows = buildAddressRowsFromMv(emails, mvResults);
         // Preserve any N2B fields already written for overlapping emails
         const priorByEmail = new Map(
@@ -492,6 +523,13 @@ export async function runPipeline(runId, { resume = false } = {}) {
 
       const mv = await verifyBulk(emails, {
         filename: `${sanitizeSegmentName(run.segment_name)}.csv`,
+        signal,
+        onFileId: async (fileId) => {
+          mvFileId = fileId;
+          // Persist immediately so hung verifying_mv runs are resumable
+          await updateRun(runId, { mv_file_id: fileId });
+          await addLog(runId, `Persisted mv_file_id=${fileId} before poll`);
+        },
         onProgress: async (message) => {
           await addLog(runId, message);
         },
@@ -499,6 +537,7 @@ export async function runPipeline(runId, { resume = false } = {}) {
 
       mvResults = mv.results;
       mvCredits = mv.creditsUsed;
+      mvFileId = mv.fileId || mvFileId;
       addressRows = buildAddressRowsFromMv(emails, mvResults);
       await upsertAddressResults(runId, addressRows);
 
@@ -508,8 +547,10 @@ export async function runPipeline(runId, { resume = false } = {}) {
         mv_unknown_count: mv.counts.unknown,
         mv_invalid_count: mv.counts.invalid,
         mv_credits_used: mvCredits,
-        mv_file_id: mv.fileId,
+        mv_file_id: mvFileId,
         stage_completed: 'mv',
+        last_error: null,
+        error_message: null,
       });
       stageCompleted = 'mv';
       await addLog(
@@ -588,25 +629,39 @@ export async function runPipeline(runId, { resume = false } = {}) {
       n2bCredits,
     });
   } catch (err) {
+    if (err?.name === 'AbortError' || /aborted/i.test(String(err?.message || ''))) {
+      await addLog(runId, 'Pipeline aborted (superseded by resume/requeue)');
+      return;
+    }
     const message = err?.message || String(err);
     console.error(`Run ${runId} failed:`, err);
     try {
       const { getRun } = await import('./db.js');
       const run = await getRun(runId);
       const nextRetry = (Number(run?.retry_count) || 0) + 1;
-      // Preserve MV work — never wipe counts/file_id on N2B failure
+      // Preserve MV work — never wipe counts/file_id on N2B/MV poll failure
       const preservedStage =
         run?.stage_completed && run.stage_completed !== 'none'
           ? run.stage_completed
           : stageCompleted;
+      const preservedFileId = run?.mv_file_id || mvFileId || null;
 
       await failRun(runId, message, {
         retry_count: nextRetry,
         stage_completed: preservedStage || 'none',
-        // keep completed_at for failed; clear only if we want resume UX
+        ...(preservedFileId ? { mv_file_id: preservedFileId } : {}),
       });
     } catch (logErr) {
       console.error('Failed to persist failure state:', logErr);
+      try {
+        await updateRun(runId, {
+          status: 'failed',
+          last_error: message,
+          error_message: message,
+        });
+      } catch {
+        // last resort already logged
+      }
     }
   }
 }
@@ -615,7 +670,15 @@ export async function resumeVerification(runId, { force = false } = {}) {
   const { getRun } = await import('./db.js');
   const run = await getRun(runId);
   if (!run) throw new Error('Run not found');
-  const resumable = ['failed', 'paused', 'queued'];
+  // Include in-progress statuses — hung verifying_mv runs must be recoverable
+  const resumable = [
+    'failed',
+    'paused',
+    'queued',
+    'verifying_mv',
+    'verifying_n2b',
+    'merging',
+  ];
   if (force && run.status === 'completed') {
     // allow repair of completed-but-corrupt runs
   } else if (!resumable.includes(run.status)) {
@@ -634,7 +697,7 @@ export async function resumeVerification(runId, { force = false } = {}) {
   });
   await addLog(
     runId,
-    `Resume requested (resume=${resume}, stage_completed=${run.stage_completed || 'none'}, mv_file_id=${run.mv_file_id || 'n/a'})`
+    `Resume requested (resume=${resume}, prior_status=${run.status}, stage_completed=${run.stage_completed || 'none'}, mv_file_id=${run.mv_file_id || 'n/a'})`
   );
   enqueueRun(runId, { resume });
   return getRun(runId);

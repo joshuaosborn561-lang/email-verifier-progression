@@ -138,7 +138,7 @@ export function createMcpServer() {
 
   server.tool(
     'resume_verification',
-    'Resume a failed or paused verification run from the last completed stage. Does not re-run MillionVerifier when mv results or mv_file_id are already available.',
+    'Resume a failed, paused, queued, or stuck in-progress run (verifying_mv / verifying_n2b / merging) from the last completed stage. Does not re-run MillionVerifier when mv_file_id or address results already exist.',
     {
       run_id: z.string().uuid(),
     },

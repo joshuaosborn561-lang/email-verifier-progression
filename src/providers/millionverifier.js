@@ -3,8 +3,27 @@ import { config } from '../config.js';
 import { VendorError, withRetry } from '../lib/retry.js';
 import { normalizeMvResult } from '../merge.js';
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }));
+      return;
+    }
+    const timer = setTimeout(resolve, ms);
+    if (!signal) return;
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) {
+    const err = Object.assign(new Error('MillionVerifier poll aborted'), { name: 'AbortError' });
+    throw err;
+  }
 }
 
 /**
@@ -85,6 +104,34 @@ function parseMvCsv(csvText) {
   }
 
   return { results, counts };
+}
+
+export function isMvFileFinished(fileinfo) {
+  const status = String(fileinfo?.status || '').toLowerCase();
+  if (status === 'finished') return true;
+  const percent = Number(fileinfo?.percent ?? 0);
+  const reverify = Number(fileinfo?.reverify ?? 0);
+  const tallied =
+    Number(fileinfo?.ok ?? 0) +
+    Number(fileinfo?.catch_all ?? 0) +
+    Number(fileinfo?.unknown ?? 0) +
+    Number(fileinfo?.invalid ?? 0);
+  // Some jobs linger in in_progress after work is done; accept terminal-looking state
+  return percent >= 100 && reverify === 0 && tallied > 0;
+}
+
+function progressKey(fileinfo) {
+  return [
+    fileinfo?.status,
+    fileinfo?.percent,
+    fileinfo?.verified,
+    fileinfo?.unverified,
+    fileinfo?.reverify,
+    fileinfo?.ok,
+    fileinfo?.catch_all,
+    fileinfo?.unknown,
+    fileinfo?.invalid,
+  ].join('|');
 }
 
 /**
@@ -172,24 +219,45 @@ export async function resolveDownloadCsv(bodyText, contentType = '', { onProgres
 /**
  * Download + parse results for an existing MillionVerifier file_id (no re-upload / no re-charge).
  */
-export async function downloadResultsByFileId(fileId, { onProgress } = {}) {
+export async function downloadResultsByFileId(
+  fileId,
+  { onProgress, signal, stageTimeoutMs, stallTimeoutMs } = {}
+) {
   if (!fileId) throw new Error('fileId is required');
 
   let delayMs = 5_000;
   const maxDelay = 30_000;
-  const deadline = Date.now() + 6 * 60 * 60 * 1000;
+  const overallMs = Number(stageTimeoutMs ?? config.mvStageTimeoutMs);
+  const stallMs = Number(stallTimeoutMs ?? config.mvStallTimeoutMs);
+  const startedAt = Date.now();
+  let lastProgressAt = Date.now();
+  let lastKey = '';
   let fileinfo = null;
 
-  while (Date.now() < deadline) {
+  while (true) {
+    throwIfAborted(signal);
+
+    if (Date.now() - startedAt > overallMs) {
+      throw new VendorError(
+        `MillionVerifier stage timed out after ${Math.round(overallMs / 60000)}m for file_id=${fileId}` +
+          ` (last status=${fileinfo?.status || 'n/a'}, percent=${fileinfo?.percent ?? 'n/a'},` +
+          ` verified=${fileinfo?.verified ?? 'n/a'}/${fileinfo?.unique_emails ?? 'n/a'},` +
+          ` ok=${fileinfo?.ok ?? 0}, catch_all=${fileinfo?.catch_all ?? 0},` +
+          ` unknown=${fileinfo?.unknown ?? 0}, invalid=${fileinfo?.invalid ?? 0}, reverify=${fileinfo?.reverify ?? 0})`,
+        { transient: true, vendor: 'millionverifier' }
+      );
+    }
+
     const infoUrl =
       `${config.millionVerifierBulkUrl}/fileinfo` +
       `?key=${encodeURIComponent(config.millionVerifierApiKey)}` +
       `&file_id=${encodeURIComponent(fileId)}`;
 
     const { value } = await withRetry(async () => {
-      const infoRes = await fetch(infoUrl);
+      throwIfAborted(signal);
+      const infoRes = await fetch(infoUrl, signal ? { signal } : undefined);
       const body = await infoRes.json().catch(() => ({}));
-      if (!infoRes.ok || body.error) {
+      if (!infoRes.ok || (body.error && String(body.error).trim())) {
         throw new VendorError(
           body.error || body.message || `MillionVerifier fileinfo HTTP ${infoRes.status}`,
           { status: infoRes.status, vendor: 'millionverifier' }
@@ -200,23 +268,46 @@ export async function downloadResultsByFileId(fileId, { onProgress } = {}) {
 
     fileinfo = value;
     const status = String(fileinfo.status || '').toLowerCase();
-    if (status === 'finished') break;
+    const key = progressKey(fileinfo);
+    if (key !== lastKey) {
+      lastKey = key;
+      lastProgressAt = Date.now();
+    } else if (Date.now() - lastProgressAt > stallMs) {
+      throw new VendorError(
+        `MillionVerifier stalled for ${Math.round(stallMs / 60000)}m on file_id=${fileId}` +
+          ` (status=${status}, percent=${fileinfo.percent ?? 0},` +
+          ` verified=${fileinfo.verified ?? 0}, unverified=${fileinfo.unverified ?? 0},` +
+          ` reverify=${fileinfo.reverify ?? 0}, result_counts=0:${Number(fileinfo.ok || 0) + Number(fileinfo.catch_all || 0) + Number(fileinfo.unknown || 0) + Number(fileinfo.invalid || 0)})`,
+        { transient: true, vendor: 'millionverifier' }
+      );
+    }
+
+    if (isMvFileFinished(fileinfo)) break;
+
     if (['error', 'failed', 'canceled', 'cancelled'].includes(status)) {
       throw new VendorError(fileinfo.error || `MillionVerifier job failed: ${status}`, {
         vendor: 'millionverifier',
       });
     }
+
     if (onProgress) {
       await onProgress(
-        `MillionVerifier file_id=${fileId} status=${status} percent=${fileinfo.percent ?? 0}`
+        `MillionVerifier file_id=${fileId} status=${status} percent=${fileinfo.percent ?? 0}` +
+          ` verified=${fileinfo.verified ?? 0} unverified=${fileinfo.unverified ?? 0}` +
+          ` reverify=${fileinfo.reverify ?? 0}` +
+          ` (ok=${fileinfo.ok ?? 0}, catch_all=${fileinfo.catch_all ?? 0}, unknown=${fileinfo.unknown ?? 0}, invalid=${fileinfo.invalid ?? 0})`
       );
     }
-    await sleep(delayMs);
+
+    await sleep(delayMs, signal);
     delayMs = Math.min(maxDelay, Math.round(delayMs * 1.4));
   }
 
-  if (String(fileinfo?.status || '').toLowerCase() !== 'finished') {
-    throw new Error('MillionVerifier polling timed out before status=finished');
+  if (!isMvFileFinished(fileinfo)) {
+    throw new VendorError(
+      `MillionVerifier polling ended before finished for file_id=${fileId}`,
+      { vendor: 'millionverifier' }
+    );
   }
 
   const downloadUrl =
@@ -226,7 +317,8 @@ export async function downloadResultsByFileId(fileId, { onProgress } = {}) {
     `&filter=all`;
 
   const { value: csvText } = await withRetry(async () => {
-    const dlRes = await fetch(downloadUrl);
+    throwIfAborted(signal);
+    const dlRes = await fetch(downloadUrl, signal ? { signal } : undefined);
     if (!dlRes.ok) {
       const errText = await dlRes.text().catch(() => '');
       throw new VendorError(
@@ -252,7 +344,6 @@ export async function downloadResultsByFileId(fileId, { onProgress } = {}) {
   };
   const fileinfoTotal =
     mergedCounts.ok + mergedCounts.catch_all + mergedCounts.unknown + mergedCounts.invalid;
-  // Truncated downloads (common under concurrent fetch) must not be treated as full results
   if (fileinfoTotal > 0 && results.size < Math.floor(fileinfoTotal * 0.95)) {
     throw new VendorError(
       `MillionVerifier download incomplete for file_id=${fileId}: parsed ${results.size} rows vs fileinfo total ${fileinfoTotal} (csv bytes=${csvText.length})`,
@@ -281,7 +372,10 @@ export async function downloadResultsByFileId(fileId, { onProgress } = {}) {
 /**
  * Stage 1 — MillionVerifier bulk verify.
  */
-export async function verifyBulk(emails, { onProgress, filename = 'verifyfall.csv' } = {}) {
+export async function verifyBulk(
+  emails,
+  { onProgress, onFileId, filename = 'verifyfall.csv', signal } = {}
+) {
   const unique = [...new Set(emails.map((e) => String(e).trim()).filter(Boolean))];
   if (!unique.length) {
     return {
@@ -297,6 +391,7 @@ export async function verifyBulk(emails, { onProgress, filename = 'verifyfall.cs
 
   const { value: uploadBody } = await withRetry(
     async () => {
+      throwIfAborted(signal);
       const form = new FormData();
       form.append('key', config.millionVerifierApiKey);
       form.append(
@@ -307,6 +402,7 @@ export async function verifyBulk(emails, { onProgress, filename = 'verifyfall.cs
       const uploadRes = await fetch(`${config.millionVerifierBulkUrl}/upload`, {
         method: 'POST',
         body: form,
+        ...(signal ? { signal } : {}),
       });
       const body = await uploadRes.json().catch(() => ({}));
       if (!uploadRes.ok || body.error) {
@@ -333,9 +429,13 @@ export async function verifyBulk(emails, { onProgress, filename = 'verifyfall.cs
     throw new Error('MillionVerifier upload did not return file_id');
   }
 
+  if (onFileId) {
+    await onFileId(String(fileId));
+  }
+
   if (onProgress) {
     await onProgress(`MillionVerifier uploaded file_id=${fileId} (${unique.length} unique emails)`);
   }
 
-  return downloadResultsByFileId(fileId, { onProgress });
+  return downloadResultsByFileId(fileId, { onProgress, signal });
 }
