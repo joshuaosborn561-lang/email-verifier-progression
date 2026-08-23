@@ -103,6 +103,16 @@ async function fetchDetail(id) {
       <span>rejected ${run.final_rejected_count ?? 0}</span>
       <span>MV ${run.mv_credits_used ?? 0} · N2B ${run.n2b_credits_used ?? 0}</span>
       ${run.mv_ok_count != null ? `<span>ok ${run.mv_ok_count} · catch_all ${run.mv_catch_all_count ?? 0} · unknown ${run.mv_unknown_count ?? 0} · invalid ${run.mv_invalid_count ?? 0}</span>` : ''}
+      ${
+        run.mail_class_seg_count != null || run.mail_class_native_count != null
+          ? `<span>SEG ${run.mail_class_seg_count ?? 0} · native ${run.mail_class_native_count ?? 0} · direct ${run.mail_class_direct_count ?? 0} · mx-unknown ${run.mail_class_unknown_count ?? 0}</span>`
+          : ''
+      }
+      ${
+        run.sendable_seg_count != null || run.sendable_other_count != null
+          ? `<span>sendable split ${run.sendable_seg_count ?? 0} SEG / ${run.sendable_other_count ?? 0} other</span>`
+          : ''
+      }
       ${run.stage_completed ? `<span>stage ${escapeHtml(run.stage_completed)}</span>` : ''}
       <span>created ${formatTs(run.created_at)}</span>
       ${run.completed_at ? `<span>completed ${formatTs(run.completed_at)}</span>` : ''}
@@ -137,9 +147,21 @@ async function fetchDetail(id) {
 
   if (data.downloads) {
     els.detailDownloads.hidden = false;
+    const extra = [];
+    if (data.downloads.sendable_seg_url) {
+      extra.push(
+        `<a href="${data.downloads.sendable_seg_url}" target="_blank" rel="noopener">Download SENDABLE_SEG CSV</a>`
+      );
+    }
+    if (data.downloads.sendable_other_url) {
+      extra.push(
+        `<a href="${data.downloads.sendable_other_url}" target="_blank" rel="noopener">Download SENDABLE_OTHER CSV</a>`
+      );
+    }
     els.detailDownloads.innerHTML = `
       <a href="${data.downloads.sendable_url}" target="_blank" rel="noopener">Download SENDABLE CSV</a>
       <a href="${data.downloads.rejected_url}" target="_blank" rel="noopener">Download REJECTED CSV</a>
+      ${extra.join('\n      ')}
     `;
   } else {
     els.detailDownloads.hidden = true;

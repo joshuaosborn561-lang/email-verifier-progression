@@ -80,11 +80,35 @@ export async function exportSendableZip(runIds) {
     usedNames.set(entryName, true);
 
     zip.file(entryName, buffer);
+
+    const extraFiles = [];
+    for (const [path, suffix] of [
+      [run.sendable_seg_path, 'SENDABLE_SEG'],
+      [run.sendable_other_path, 'SENDABLE_OTHER'],
+    ]) {
+      if (!path) continue;
+      try {
+        const extra = await downloadFile(config.resultsBucket, path);
+        let extraName = `${segment}_${suffix}.csv`;
+        if (usedNames.has(extraName)) {
+          extraName = `${segment}_${runId.slice(0, 8)}_${suffix}.csv`;
+        }
+        usedNames.set(extraName, true);
+        zip.file(extraName, extra);
+        extraFiles.push(extraName);
+      } catch {
+        // Combined SENDABLE remains the primary artifact
+      }
+    }
+
     included.push({
       run_id: runId,
       segment_name: run.segment_name,
       final_sendable_count: run.final_sendable_count,
+      sendable_seg_count: run.sendable_seg_count ?? null,
+      sendable_other_count: run.sendable_other_count ?? null,
       entry_name: entryName,
+      extra_files: extraFiles,
     });
   }
 

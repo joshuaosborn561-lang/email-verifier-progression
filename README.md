@@ -2,11 +2,16 @@
 
 Node.js/Express dashboard + MCP server that runs an email verification waterfall:
 
+0. **MX / SEG tagging** (free, cache-first) — resolve each domain’s mail exchanger and tag the contact (`seg` / `native_filter` / `direct` / `unknown`). Nothing is dropped, deprioritised, or filtered.
 1. **MillionVerifier** (bulk file API) — classify `ok` / `catch_all` / `unknown` / `invalid`
 2. **no2bounce** — re-check `catch_all` and `unknown` as **separate cohorts** (batched submits)
-3. **Merge** — final sendable = MV `ok` + No2Bounce-confirmed catch-alls + No2Bounce-confirmed unknowns; everything else rejected. Addresses with no verdict from either vendor increment `unresolved_after_n2b`.
+3. **Merge** — final sendable = MV `ok` + No2Bounce-confirmed catch-alls + No2Bounce-confirmed unknowns; everything else rejected. Addresses with no verdict from either vendor increment `unresolved_after_n2b`. Campaign staging also writes `_SENDABLE_SEG.csv` (third-party gateway) and `_SENDABLE_OTHER.csv` (everyone else) so bounce/reply rates can be measured separately. Combined `_SENDABLE.csv` is unchanged.
 
-CSV columns are preserved; only `verification_source`, `verification_status`, and `confidence` are added.
+CSV columns are preserved; added columns are `verification_source`, `verification_status`, `confidence`, `behind_gateway`, `mail_class`, `gateway_provider`, `mx_host`, and `campaign_split`.
+
+`mail_class` is `seg` (Proofpoint / Mimecast / Barracuda / Cisco / etc.), `native_filter` (Google or Microsoft’s own MX), `direct` (any other MX), or `unknown` (no MX / lookup failed). Google and Microsoft are **not** lumped in with third-party gateways. The raw MX host is kept so unmatched hosts can grow the provider list from real data.
+
+Domain answers are persisted in `domain_mx_cache` and reused across clients and runs.
 
 ## Stack
 
@@ -52,7 +57,7 @@ Endpoint: `POST /mcp` (Streamable HTTP). Responses are summary-only — never fu
 
 ## Resume & partial results
 
-Per-address MillionVerifier results are persisted before No2Bounce starts. Failed or paused runs keep that work; `resume_verification` continues from `stage_completed` (`none` → `mv` → `n2b` → `merge`) and will not re-bill MillionVerifier when `mv_file_id` / address rows already exist.
+Per-address MillionVerifier results are persisted before No2Bounce starts. Failed or paused runs keep that work; `resume_verification` continues from `stage_completed` (`none` → `mx` → `mv` → `n2b` → `merge`) and will not re-bill MillionVerifier when `mv_file_id` / address rows already exist. MX tagging is free and is skipped for addresses that already have a `mail_class`.
 
 `get_verification_results` returns `{ partial: true, ... }` for failed, paused, and in-progress runs, with per-stage counts and any downloadable partial CSVs.
 

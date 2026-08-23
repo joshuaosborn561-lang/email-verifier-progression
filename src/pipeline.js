@@ -10,11 +10,16 @@ import {
   upsertAddressResults,
 } from './db.js';
 import { mergeRunResults, resolveAddressOutcome } from './merge.js';
+import { extractDomain, MAIL_CLASS, mxTagColumns, summarizeMailClasses } from './mx.js';
 import {
   downloadResultsByFileId,
   getCredits,
   verifyBulk,
 } from './providers/millionverifier.js';
+import {
+  classifyEmailsByMx,
+  mxRecordFromLookup,
+} from './providers/mx-lookup.js';
 import { validateCohorts } from './providers/no2bounce.js';
 import {
   downloadFile,
@@ -75,21 +80,54 @@ async function failRun(runId, message, extra = {}) {
   });
 }
 
-function buildAddressRowsFromMv(emails, mvResults) {
+function applyMxRecord(row, mx) {
+  if (!mx) return row;
+  return {
+    ...row,
+    domain: mx.domain ?? row.domain ?? null,
+    mail_class: mx.mail_class ?? row.mail_class ?? null,
+    gateway_provider: mx.gateway_provider ?? row.gateway_provider ?? null,
+    mx_host: mx.mx_host ?? row.mx_host ?? null,
+    behind_gateway:
+      mx.behind_gateway ??
+      row.behind_gateway ??
+      mx.mail_class === MAIL_CLASS.SEG,
+  };
+}
+
+function mxMapFromAddressRows(rows) {
+  const map = new Map();
+  for (const row of rows) {
+    if (!row.mail_class && !row.mx_host && !row.domain) continue;
+    map.set(row.email, {
+      domain: row.domain || null,
+      mail_class: row.mail_class || MAIL_CLASS.UNKNOWN,
+      gateway_provider: row.gateway_provider || 'none',
+      mx_host: row.mx_host || null,
+      behind_gateway: Boolean(row.behind_gateway || row.mail_class === MAIL_CLASS.SEG),
+    });
+  }
+  return map;
+}
+
+function buildAddressRowsFromMv(emails, mvResults, mxByEmail = new Map()) {
   const unique = [...new Set(emails.map((e) => String(e).trim().toLowerCase()).filter(Boolean))];
   return unique.map((key) => {
     const mv = mvResults.get(key)?.result || 'unknown';
     const cohort = mv === 'catch_all' || mv === 'unknown' ? mv : null;
     const outcome = resolveAddressOutcome(mv, null);
-    return {
-      email: key,
-      mv_result: mv,
-      n2b_status: null,
-      n2b_cohort: cohort,
-      final_disposition: outcome.final_disposition,
-      confidence: outcome.confidence,
-      verification_source: outcome.verification_source,
-    };
+    return applyMxRecord(
+      {
+        email: key,
+        mv_result: mv,
+        n2b_status: null,
+        n2b_cohort: cohort,
+        final_disposition: outcome.final_disposition,
+        confidence: outcome.confidence,
+        verification_source: outcome.verification_source,
+      },
+      mxByEmail.get(key)
+    );
   });
 }
 
@@ -132,35 +170,51 @@ function n2bMapFromAddressRows(rows) {
   return map;
 }
 
-async function persistPartialCsvs(runId, segment, records, emailCol, columns, mvResults, n2bResults) {
-  const merged = mergeRunResults({ records, emailCol, mvResults, n2bResults });
-  // Only include rows that are fully resolved (not pending)
+async function persistPartialCsvs(
+  runId,
+  segment,
+  records,
+  emailCol,
+  columns,
+  mvResults,
+  n2bResults,
+  mxByEmail = new Map()
+) {
+  const merged = mergeRunResults({ records, emailCol, mvResults, n2bResults, mxByEmail });
   const sendable = merged.sendable;
   const rejected = merged.rejected;
 
-  const outColumns = [
-    ...columns.filter(
-      (c) =>
-        c !== 'verification_source' &&
-        c !== 'verification_status' &&
-        c !== 'confidence'
-    ),
+  const extraCols = [
     'verification_source',
     'verification_status',
     'confidence',
+    ...mxTagColumns(),
+    'campaign_split',
+  ];
+  const outColumns = [
+    ...columns.filter((c) => !extraCols.includes(c)),
+    ...extraCols,
   ];
 
   const sendablePath = `${runId}/${segment}_SENDABLE.csv`;
   const rejectedPath = `${runId}/${segment}_REJECTED.csv`;
+  const sendableSegPath = `${runId}/${segment}_SENDABLE_SEG.csv`;
+  const sendableOtherPath = `${runId}/${segment}_SENDABLE_OTHER.csv`;
 
   await uploadFile(config.resultsBucket, sendablePath, toCsv(sendable, outColumns));
   await uploadFile(config.resultsBucket, rejectedPath, toCsv(rejected, outColumns));
+  await uploadFile(config.resultsBucket, sendableSegPath, toCsv(merged.sendableSeg, outColumns));
+  await uploadFile(config.resultsBucket, sendableOtherPath, toCsv(merged.sendableOther, outColumns));
 
   return {
     sendablePath,
     rejectedPath,
+    sendableSegPath,
+    sendableOtherPath,
     sendableCount: sendable.length,
     rejectedCount: rejected.length,
+    sendableSegCount: merged.sendableSeg.length,
+    sendableOtherCount: merged.sendableOther.length,
     unresolvedAfterN2b: merged.unresolvedAfterN2b,
     confirmedCount: merged.confirmedCount,
     unresolvedCatchallCount: merged.unresolvedCatchallCount,
@@ -300,9 +354,13 @@ async function runMergeStage({
   mvResults,
   n2bResults,
   n2bCredits,
+  mxByEmail,
 }) {
   await updateRun(runId, { status: 'merging' });
-  await addLog(runId, 'Merging results into SENDABLE / REJECTED CSVs');
+  await addLog(
+    runId,
+    'Merging results into SENDABLE / REJECTED CSVs and campaign splits (SENDABLE_SEG vs SENDABLE_OTHER)'
+  );
 
   const segment = sanitizeSegmentName(run.segment_name);
   const merged = await persistPartialCsvs(
@@ -312,10 +370,10 @@ async function runMergeStage({
     emailCol,
     columns,
     mvResults,
-    n2bResults
+    n2bResults,
+    mxByEmail
   );
 
-  // Finalize address dispositions
   const addressRows = [];
   for (const row of records) {
     const email = String(row[emailCol] || '').trim().toLowerCase();
@@ -323,15 +381,21 @@ async function runMergeStage({
     const mv = mvResults.get(email)?.result || 'unknown';
     const n2b = n2bResults.get(email) || null;
     const outcome = resolveAddressOutcome(mv, n2b);
-    addressRows.push({
-      email,
-      mv_result: mv,
-      n2b_status: n2b?.status ?? null,
-      n2b_cohort: mv === 'catch_all' || mv === 'unknown' ? mv : null,
-      final_disposition: outcome.final_disposition === 'pending' ? 'rejected' : outcome.final_disposition,
-      confidence: outcome.confidence || 'rejected',
-      verification_source: outcome.verification_source,
-    });
+    addressRows.push(
+      applyMxRecord(
+        {
+          email,
+          mv_result: mv,
+          n2b_status: n2b?.status ?? null,
+          n2b_cohort: mv === 'catch_all' || mv === 'unknown' ? mv : null,
+          final_disposition:
+            outcome.final_disposition === 'pending' ? 'rejected' : outcome.final_disposition,
+          confidence: outcome.confidence || 'rejected',
+          verification_source: outcome.verification_source,
+        },
+        mxByEmail.get(email)
+      )
+    );
   }
   await upsertAddressResults(runId, addressRows);
 
@@ -340,10 +404,14 @@ async function runMergeStage({
     stage_completed: 'merge',
     final_sendable_count: merged.sendableCount,
     final_rejected_count: merged.rejectedCount,
+    sendable_seg_count: merged.sendableSegCount,
+    sendable_other_count: merged.sendableOtherCount,
     unresolved_after_n2b_count: merged.unresolvedAfterN2b,
     n2b_credits_used: n2bCredits,
     sendable_path: merged.sendablePath,
     rejected_path: merged.rejectedPath,
+    sendable_seg_path: merged.sendableSegPath,
+    sendable_other_path: merged.sendableOtherPath,
     completed_at: new Date().toISOString(),
     error_message: null,
     last_error: null,
@@ -351,15 +419,91 @@ async function runMergeStage({
 
   await addLog(
     runId,
-    `Completed — sendable=${merged.sendableCount} (confirmed=${merged.confirmedCount}, ` +
-      `unresolved_catchall=${merged.unresolvedCatchallCount}), rejected=${merged.rejectedCount}, ` +
-      `unresolved_after_n2b=${merged.unresolvedAfterN2b}`
+    `Completed — sendable=${merged.sendableCount} (seg=${merged.sendableSegCount}, other=${merged.sendableOtherCount}, ` +
+      `confirmed=${merged.confirmedCount}, unresolved_catchall=${merged.unresolvedCatchallCount}), ` +
+      `rejected=${merged.rejectedCount}, unresolved_after_n2b=${merged.unresolvedAfterN2b}`
   );
+}
+
+async function runMxStage({ runId, emails, existingRows = [] }) {
+  await updateRun(runId, { status: 'classifying_mx', last_error: null });
+  await addLog(
+    runId,
+    `MX / SEG tagging ${emails.length} addresses (free; cache-first; nothing is dropped)`
+  );
+
+  const existingMx = mxMapFromAddressRows(existingRows);
+  const priorByEmail = new Map(existingRows.map((r) => [r.email, r]));
+  const needLookup = emails.filter((e) => !existingMx.has(String(e).toLowerCase()));
+
+  const byEmail = new Map(existingMx);
+  let cachedHits = 0;
+  let lookedUp = 0;
+
+  if (needLookup.length) {
+    const mx = await classifyEmailsByMx(needLookup, {
+      onProgress: async (message) => addLog(runId, message),
+    });
+    for (const [email, result] of mx.byEmail) {
+      byEmail.set(email, mxRecordFromLookup(result));
+    }
+    cachedHits = mx.cachedHits;
+    lookedUp = mx.lookedUp;
+  } else {
+    cachedHits = new Set(
+      [...existingMx.values()].map((m) => m.domain).filter(Boolean)
+    ).size;
+    await addLog(runId, `Resume: all ${existingMx.size} addresses already have MX tags — skipping DNS`);
+  }
+
+  const uniqueDomains = new Set(
+    [...byEmail.values()].map((m) => m.domain).filter(Boolean)
+  ).size;
+
+  const rows = emails.map((raw) => {
+    const email = String(raw).toLowerCase();
+    const mx = byEmail.get(email);
+    const prior = priorByEmail.get(email);
+    return applyMxRecord(
+      {
+        email,
+        mv_result: prior?.mv_result ?? null,
+        n2b_status: prior?.n2b_status ?? null,
+        n2b_cohort: prior?.n2b_cohort ?? null,
+        final_disposition: prior?.final_disposition ?? 'pending',
+        confidence: prior?.confidence ?? null,
+        verification_source: prior?.verification_source ?? null,
+      },
+      mx
+    );
+  });
+  await upsertAddressResults(runId, rows);
+
+  const summary = summarizeMailClasses(rows);
+  await updateRun(runId, {
+    stage_completed: 'mx',
+    mx_domain_count: uniqueDomains || summary.domains,
+    mx_cache_hits: cachedHits,
+    mx_lookups: lookedUp,
+    mail_class_seg_count: summary.seg,
+    mail_class_native_count: summary.native_filter,
+    mail_class_direct_count: summary.direct,
+    mail_class_unknown_count: summary.unknown,
+  });
+  await addLog(
+    runId,
+    `MX tagging complete — domains=${uniqueDomains || summary.domains} cache_hits=${cachedHits} fresh=${lookedUp}; ` +
+      `seg=${summary.seg} native_filter=${summary.native_filter} direct=${summary.direct} unknown=${summary.unknown}. ` +
+      `No contacts removed.`
+  );
+
+  return { mxByEmail: byEmail, addressRows: rows, summary };
 }
 
 /**
  * Main pipeline. Supports resume from last completed stage.
- * - stage none / no mv_file_id → run MillionVerifier
+ * - always tag MX / SEG first (free; never drops contacts)
+ * - stage none / mx / no mv_file_id → run MillionVerifier
  * - stage mv (or mv_file_id present) → skip MV, run N2B on pending cohorts
  * - stage n2b → skip to merge
  */
@@ -400,6 +544,34 @@ export async function runPipeline(runId, { resume = false, signal } = {}) {
     let mvResults = new Map();
     let mvCredits = Number(run.mv_credits_used) || 0;
     let addressRows = [];
+    let mxByEmail = new Map();
+
+    // ── Stage 0: MX / SEG tagging (free, before paid verification) ────────
+    try {
+      const existingForMx = await listAddressResults(runId);
+      const mxStage = await runMxStage({
+        runId,
+        emails: emails.map((e) => String(e).trim().toLowerCase()).filter(Boolean),
+        existingRows: existingForMx,
+      });
+      mxByEmail = mxStage.mxByEmail;
+    } catch (mxErr) {
+      await addLog(
+        runId,
+        `WARNING: MX tagging failed (${mxErr?.message || mxErr}); tagging unknown and continuing. No contacts removed.`
+      );
+      for (const raw of emails) {
+        const email = String(raw).trim().toLowerCase();
+        if (!email || mxByEmail.has(email)) continue;
+        mxByEmail.set(email, {
+          domain: extractDomain(email),
+          mail_class: MAIL_CLASS.UNKNOWN,
+          gateway_provider: 'none',
+          mx_host: null,
+          behind_gateway: false,
+        });
+      }
+    }
 
     // ── Stage 1: MillionVerifier ──────────────────────────────────────────
     if (canSkipMv && (run.mv_file_id || stageCompleted !== 'none')) {
@@ -439,6 +611,9 @@ export async function runPipeline(runId, { resume = false, signal } = {}) {
 
       if (coverageOk) {
         mvResults = mvMapFromAddressRows(addressRows);
+        for (const [email, mx] of mxMapFromAddressRows(addressRows)) {
+          if (!mxByEmail.has(email)) mxByEmail.set(email, mx);
+        }
         await addLog(
           runId,
           `Resume: using ${addressRows.length} persisted address rows (expected ≈ ${expectedMvRows})`
@@ -456,22 +631,24 @@ export async function runPipeline(runId, { resume = false, signal } = {}) {
         mvResults = mv.results;
         mvCredits = mv.creditsUsed;
         mvFileId = mv.fileId;
-        addressRows = buildAddressRowsFromMv(emails, mvResults);
+        addressRows = buildAddressRowsFromMv(emails, mvResults, mxByEmail);
         // Preserve any N2B fields already written for overlapping emails
         const priorByEmail = new Map(
           (await listAddressResults(runId)).map((r) => [r.email, r])
         );
         addressRows = addressRows.map((row) => {
           const prior = priorByEmail.get(row.email);
-          if (!prior?.n2b_status) return row;
-          return {
-            ...row,
-            n2b_status: prior.n2b_status,
-            n2b_cohort: prior.n2b_cohort || row.n2b_cohort,
-            final_disposition: prior.final_disposition || row.final_disposition,
-            confidence: prior.confidence || row.confidence,
-            verification_source: prior.verification_source || row.verification_source,
-          };
+          const next = !prior?.n2b_status
+            ? row
+            : {
+                ...row,
+                n2b_status: prior.n2b_status,
+                n2b_cohort: prior.n2b_cohort || row.n2b_cohort,
+                final_disposition: prior.final_disposition || row.final_disposition,
+                confidence: prior.confidence || row.confidence,
+                verification_source: prior.verification_source || row.verification_source,
+              };
+          return applyMxRecord(next, mxByEmail.get(row.email) || prior);
         });
         await upsertAddressResults(runId, addressRows);
         await updateRun(runId, {
@@ -538,7 +715,7 @@ export async function runPipeline(runId, { resume = false, signal } = {}) {
       mvResults = mv.results;
       mvCredits = mv.creditsUsed;
       mvFileId = mv.fileId || mvFileId;
-      addressRows = buildAddressRowsFromMv(emails, mvResults);
+      addressRows = buildAddressRowsFromMv(emails, mvResults, mxByEmail);
       await upsertAddressResults(runId, addressRows);
 
       await updateRun(runId, {
@@ -627,6 +804,7 @@ export async function runPipeline(runId, { resume = false, signal } = {}) {
       mvResults,
       n2bResults,
       n2bCredits,
+      mxByEmail,
     });
   } catch (err) {
     if (err?.name === 'AbortError' || /aborted/i.test(String(err?.message || ''))) {
@@ -675,6 +853,7 @@ export async function resumeVerification(runId, { force = false } = {}) {
     'failed',
     'paused',
     'queued',
+    'classifying_mx',
     'verifying_mv',
     'verifying_n2b',
     'merging',
@@ -687,7 +866,7 @@ export async function resumeVerification(runId, { force = false } = {}) {
 
   const resume =
     Boolean(run.mv_file_id) ||
-    ['mv', 'n2b', 'merge'].includes(run.stage_completed || 'none');
+    ['mx', 'mv', 'n2b', 'merge'].includes(run.stage_completed || 'none');
 
   await updateRun(runId, {
     status: 'queued',
@@ -767,6 +946,15 @@ export async function buildResultsPayload(run) {
     unresolved_after_n2b_count: run.unresolved_after_n2b_count ?? 0,
     mv_credits_used: run.mv_credits_used ?? 0,
     n2b_credits_used: run.n2b_credits_used ?? 0,
+    mx_domain_count: run.mx_domain_count ?? 0,
+    mx_cache_hits: run.mx_cache_hits ?? 0,
+    mx_lookups: run.mx_lookups ?? 0,
+    mail_class_seg_count: run.mail_class_seg_count ?? 0,
+    mail_class_native_count: run.mail_class_native_count ?? 0,
+    mail_class_direct_count: run.mail_class_direct_count ?? 0,
+    mail_class_unknown_count: run.mail_class_unknown_count ?? 0,
+    sendable_seg_count: run.sendable_seg_count ?? 0,
+    sendable_other_count: run.sendable_other_count ?? 0,
   };
 
   let addressCounts = null;
@@ -793,12 +981,20 @@ export async function buildResultsPayload(run) {
 
   if (run.sendable_path && run.rejected_path) {
     const { createSignedUrl } = await import('./storage.js');
-    const [sendable_url, rejected_url] = await Promise.all([
+    const [sendable_url, rejected_url, sendable_seg_url, sendable_other_url] = await Promise.all([
       createSignedUrl(config.resultsBucket, run.sendable_path),
       createSignedUrl(config.resultsBucket, run.rejected_path),
+      run.sendable_seg_path
+        ? createSignedUrl(config.resultsBucket, run.sendable_seg_path)
+        : Promise.resolve(null),
+      run.sendable_other_path
+        ? createSignedUrl(config.resultsBucket, run.sendable_other_path)
+        : Promise.resolve(null),
     ]);
     payload.sendable_url = sendable_url;
     payload.rejected_url = rejected_url;
+    if (sendable_seg_url) payload.sendable_seg_url = sendable_seg_url;
+    if (sendable_other_url) payload.sendable_other_url = sendable_other_url;
   } else if (partial && addressCounts && addressCounts.total > 0) {
     // Generate partial CSVs from persisted address rows + original upload
     try {
@@ -807,6 +1003,7 @@ export async function buildResultsPayload(run) {
       const addressRows = await listAddressResults(run.id);
       const mvResults = mvMapFromAddressRows(addressRows);
       const n2bResults = n2bMapFromAddressRows(addressRows);
+      const mxByEmail = mxMapFromAddressRows(addressRows);
       // For pending N2B rows, include them as unresolved rejected in partial export
       const n2bForMerge = new Map(n2bResults);
       for (const row of addressRows) {
@@ -825,21 +1022,30 @@ export async function buildResultsPayload(run) {
         emailCol,
         columns,
         mvResults,
-        n2bForMerge
+        n2bForMerge,
+        mxByEmail
       );
       await updateRun(run.id, {
         sendable_path: files.sendablePath,
         rejected_path: files.rejectedPath,
+        sendable_seg_path: files.sendableSegPath,
+        sendable_other_path: files.sendableOtherPath,
         final_sendable_count: files.sendableCount,
         final_rejected_count: files.rejectedCount,
+        sendable_seg_count: files.sendableSegCount,
+        sendable_other_count: files.sendableOtherCount,
       });
       const { createSignedUrl } = await import('./storage.js');
-      const [sendable_url, rejected_url] = await Promise.all([
+      const [sendable_url, rejected_url, sendable_seg_url, sendable_other_url] = await Promise.all([
         createSignedUrl(config.resultsBucket, files.sendablePath),
         createSignedUrl(config.resultsBucket, files.rejectedPath),
+        createSignedUrl(config.resultsBucket, files.sendableSegPath),
+        createSignedUrl(config.resultsBucket, files.sendableOtherPath),
       ]);
       payload.sendable_url = sendable_url;
       payload.rejected_url = rejected_url;
+      payload.sendable_seg_url = sendable_seg_url;
+      payload.sendable_other_url = sendable_other_url;
       payload.final_sendable_count = files.sendableCount;
       payload.final_rejected_count = files.rejectedCount;
       payload.partial_note =

@@ -2,6 +2,7 @@ import {
   isAcceptAllDeliverable,
   isStrictDeliverable,
 } from './providers/no2bounce.js';
+import { campaignSplit, MAIL_CLASS } from './mx.js';
 
 /**
  * Decide final disposition for one address after MV (+ optional N2B).
@@ -91,9 +92,22 @@ export function resolveAddressOutcome(mvResult, n2bResult) {
 /**
  * Build sendable/rejected row arrays and aggregate counters from MV + N2B maps.
  */
-export function mergeRunResults({ records, emailCol, mvResults, n2bResults }) {
+function attachMxTags(out, mx) {
+  const mailClass = mx?.mail_class || MAIL_CLASS.UNKNOWN;
+  const behind = Boolean(mx?.behind_gateway || mailClass === MAIL_CLASS.SEG);
+  out.behind_gateway = behind ? 'yes' : 'no';
+  out.mail_class = mailClass;
+  out.gateway_provider = mx?.gateway_provider || 'none';
+  out.mx_host = mx?.mx_host || '';
+  out.campaign_split = campaignSplit(mailClass);
+  return out;
+}
+
+export function mergeRunResults({ records, emailCol, mvResults, n2bResults, mxByEmail }) {
   const sendable = [];
   const rejected = [];
+  const sendableSeg = [];
+  const sendableOther = [];
   let confirmedCount = 0;
   let unresolvedCatchallCount = 0;
   let unresolvedAfterN2b = 0;
@@ -103,16 +117,22 @@ export function mergeRunResults({ records, emailCol, mvResults, n2bResults }) {
     const mvRow = mvResults.get(email) || { result: 'unknown' };
     const n2b = n2bResults.get(email) || null;
     const outcome = resolveAddressOutcome(mvRow.result, n2b);
+    const mx = mxByEmail?.get(email) || null;
 
-    const out = {
-      ...row,
-      verification_source: outcome.verification_source,
-      verification_status: outcome.verification_status,
-      confidence: outcome.confidence || 'rejected',
-    };
+    const out = attachMxTags(
+      {
+        ...row,
+        verification_source: outcome.verification_source,
+        verification_status: outcome.verification_status,
+        confidence: outcome.confidence || 'rejected',
+      },
+      mx
+    );
 
     if (outcome.final_disposition === 'sendable') {
       sendable.push(out);
+      if (out.campaign_split === 'seg') sendableSeg.push(out);
+      else sendableOther.push(out);
       if (outcome.confidence === 'confirmed') confirmedCount += 1;
       if (outcome.confidence === 'unresolved_catchall') unresolvedCatchallCount += 1;
     } else if (outcome.final_disposition === 'pending') {
@@ -129,6 +149,8 @@ export function mergeRunResults({ records, emailCol, mvResults, n2bResults }) {
   return {
     sendable,
     rejected,
+    sendableSeg,
+    sendableOther,
     confirmedCount,
     unresolvedCatchallCount,
     unresolvedAfterN2b,

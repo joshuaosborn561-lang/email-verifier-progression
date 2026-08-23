@@ -43,11 +43,19 @@ export function createApiRouter() {
       const logs = await getRunLogs(req.params.id);
       let downloads = null;
       if (run.status === 'completed' && run.sendable_path && run.rejected_path) {
-        const [sendable_url, rejected_url] = await Promise.all([
+        const [sendable_url, rejected_url, sendable_seg_url, sendable_other_url] = await Promise.all([
           createSignedUrl(config.resultsBucket, run.sendable_path),
           createSignedUrl(config.resultsBucket, run.rejected_path),
+          run.sendable_seg_path
+            ? createSignedUrl(config.resultsBucket, run.sendable_seg_path)
+            : Promise.resolve(null),
+          run.sendable_other_path
+            ? createSignedUrl(config.resultsBucket, run.sendable_other_path)
+            : Promise.resolve(null),
         ]);
         downloads = { sendable_url, rejected_url };
+        if (sendable_seg_url) downloads.sendable_seg_url = sendable_seg_url;
+        if (sendable_other_url) downloads.sendable_other_url = sendable_other_url;
       }
       res.json({ run, logs, downloads });
     } catch (err) {

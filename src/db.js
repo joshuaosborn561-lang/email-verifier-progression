@@ -115,7 +115,7 @@ export async function upsertAddressResults(runId, rows) {
   for (const row of rows) {
     const email = String(row.email || '').trim().toLowerCase();
     if (!email) continue;
-    byEmail.set(email, {
+    const next = {
       run_id: runId,
       email,
       mv_result: row.mv_result ?? null,
@@ -125,7 +125,17 @@ export async function upsertAddressResults(runId, rows) {
       confidence: row.confidence ?? null,
       verification_source: row.verification_source ?? null,
       updated_at: now,
-    });
+    };
+    // Only write MX tags when the caller classified this address so later
+    // MV/N2B upserts cannot wipe a completed MX stage.
+    if (row.mail_class != null) {
+      next.domain = row.domain ?? null;
+      next.mail_class = row.mail_class;
+      next.gateway_provider = row.gateway_provider ?? null;
+      next.mx_host = row.mx_host ?? null;
+      next.behind_gateway = row.behind_gateway ?? null;
+    }
+    byEmail.set(email, next);
   }
   const payload = [...byEmail.values()];
 
@@ -175,6 +185,11 @@ export async function countAddressResultsByDisposition(runId) {
     mv_invalid: 0,
     n2b_resolved: 0,
     awaiting_n2b: 0,
+    mail_class_seg: 0,
+    mail_class_native_filter: 0,
+    mail_class_direct: 0,
+    mail_class_unknown: 0,
+    behind_gateway: 0,
   };
   for (const row of rows) {
     if (row.final_disposition === 'sendable') counts.sendable += 1;
@@ -190,6 +205,62 @@ export async function countAddressResultsByDisposition(runId) {
     else if (row.mv_result === 'catch_all' || row.mv_result === 'unknown') {
       counts.awaiting_n2b += 1;
     }
+
+    if (row.mail_class === 'seg') counts.mail_class_seg += 1;
+    else if (row.mail_class === 'native_filter') counts.mail_class_native_filter += 1;
+    else if (row.mail_class === 'direct') counts.mail_class_direct += 1;
+    else if (row.mail_class === 'unknown') counts.mail_class_unknown += 1;
+    if (row.behind_gateway === true || row.mail_class === 'seg') counts.behind_gateway += 1;
   }
   return counts;
+}
+
+export async function getDomainMxCache(domain) {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('domain_mx_cache')
+    .select('*')
+    .eq('domain', domain)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+export async function incrementDomainMxSeen(domain) {
+  const supabase = getSupabase();
+  const { data: existing, error: readErr } = await supabase
+    .from('domain_mx_cache')
+    .select('lookup_count')
+    .eq('domain', domain)
+    .maybeSingle();
+  if (readErr) throw readErr;
+  const next = (Number(existing?.lookup_count) || 0) + 1;
+  const { error } = await supabase
+    .from('domain_mx_cache')
+    .update({
+      lookup_count: next,
+      last_seen_at: new Date().toISOString(),
+    })
+    .eq('domain', domain);
+  if (error) throw error;
+}
+
+export async function upsertDomainMxCache(row) {
+  const supabase = getSupabase();
+  const now = new Date().toISOString();
+  const { error } = await supabase.from('domain_mx_cache').upsert(
+    {
+      domain: row.domain,
+      mx_host: row.mx_host ?? null,
+      mx_hosts: row.mx_hosts ?? null,
+      mail_class: row.mail_class ?? 'unknown',
+      gateway_provider: row.gateway_provider ?? 'none',
+      lookup_error: row.lookup_error ?? null,
+      lookup_count: 1,
+      first_seen_at: now,
+      last_seen_at: now,
+    },
+    { onConflict: 'domain', ignoreDuplicates: true }
+  );
+  if (error) throw error;
 }

@@ -30,6 +30,12 @@ function summarizeRun(run) {
     n2b_unknown_candidates: run.n2b_unknown_candidates ?? 0,
     n2b_unknown_deliverable: run.n2b_unknown_deliverable ?? 0,
     unresolved_after_n2b_count: run.unresolved_after_n2b_count ?? 0,
+    mail_class_seg_count: run.mail_class_seg_count ?? 0,
+    mail_class_native_count: run.mail_class_native_count ?? 0,
+    mail_class_direct_count: run.mail_class_direct_count ?? 0,
+    mail_class_unknown_count: run.mail_class_unknown_count ?? 0,
+    sendable_seg_count: run.sendable_seg_count ?? 0,
+    sendable_other_count: run.sendable_other_count ?? 0,
     stage_completed: run.stage_completed || 'none',
     last_error: run.last_error || run.error_message || null,
     retry_count: run.retry_count ?? 0,
@@ -54,11 +60,13 @@ export function createMcpServer() {
     'start_verification',
     [
       'Start a FULL email verification waterfall from a CSV file URL.',
-      'Always runs end-to-end: (1) MillionVerifier classifies ok/catch_all/unknown/invalid,',
+      'Always runs end-to-end: (0) free MX lookup tags each contact (seg / native_filter / direct / unknown) — nothing is dropped;',
+      '(1) MillionVerifier classifies ok/catch_all/unknown/invalid,',
       '(2) catch_all AND unknown are sent to No2Bounce,',
       '(3) final SENDABLE = MV ok + No2Bounce-confirmed catch_alls + No2Bounce-confirmed unknowns;',
       'final REJECTED = MV invalid + No2Bounce rejects / unresolved.',
-      'Does NOT stop after MillionVerifier.',
+      'Campaign staging also writes SENDABLE_SEG (third-party gateway) and SENDABLE_OTHER (everyone else) — same copy, separate campaign.',
+      'Does NOT stop after MillionVerifier. Does NOT filter or suppress gateway-protected contacts.',
       'Returns immediately with run_id — poll get_verification_status until status=completed, then get_verification_results for the final files.',
       'Never returns per-email results.',
     ].join(' '),
@@ -72,8 +80,8 @@ export function createMcpServer() {
         run_id: run.id,
         status: run.status,
         segment_name: run.segment_name,
-        waterfall: 'millionverifier -> no2bounce(catch_all+unknown) -> merge sendable/rejected',
-        note: 'Pipeline continues automatically through No2Bounce and final merge. Poll until status=completed.',
+        waterfall: 'mx-tag -> millionverifier -> no2bounce(catch_all+unknown) -> merge sendable/rejected + seg/other split',
+        note: 'MX tagging is free and never drops contacts. Pipeline continues automatically through No2Bounce and final merge. Poll until status=completed.',
       });
     }
   );
@@ -102,6 +110,12 @@ export function createMcpServer() {
         n2b_unknown_candidates: run.n2b_unknown_candidates ?? 0,
         n2b_unknown_deliverable: run.n2b_unknown_deliverable ?? 0,
         unresolved_after_n2b_count: run.unresolved_after_n2b_count ?? 0,
+        mail_class_seg_count: run.mail_class_seg_count ?? 0,
+        mail_class_native_count: run.mail_class_native_count ?? 0,
+        mail_class_direct_count: run.mail_class_direct_count ?? 0,
+        mail_class_unknown_count: run.mail_class_unknown_count ?? 0,
+        sendable_seg_count: run.sendable_seg_count ?? 0,
+        sendable_other_count: run.sendable_other_count ?? 0,
         stage_completed: run.stage_completed || 'none',
         last_error: run.last_error || run.error_message || null,
         retry_count: run.retry_count ?? 0,
@@ -138,7 +152,7 @@ export function createMcpServer() {
 
   server.tool(
     'resume_verification',
-    'Resume a failed, paused, queued, or stuck in-progress run (verifying_mv / verifying_n2b / merging) from the last completed stage. Does not re-run MillionVerifier when mv_file_id or address results already exist.',
+    'Resume a failed, paused, queued, or stuck in-progress run (classifying_mx / verifying_mv / verifying_n2b / merging) from the last completed stage. Does not re-run MillionVerifier when mv_file_id or address results already exist. Re-runs free MX tagging only for addresses that still lack a mail_class.',
     {
       run_id: z.string().uuid(),
     },
