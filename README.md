@@ -50,12 +50,14 @@ Endpoint: `POST /mcp` (Streamable HTTP). Responses are summary-only — never fu
 
 | Tool | Returns |
 |---|---|
-| `start_verification(file_url, segment_name)` | `{ run_id }` immediately |
-| `get_verification_status(run_id)` | status + counts + credits |
+| `start_verification(file_url, segment_name, prior_run_id?, force_fresh?)` | `{ run_id }` immediately. Pass `prior_run_id` whenever a run already exists for the file. |
+| `get_verification_status(run_id)` | status + counts + credits + `useful_output_count` |
 | `list_verification_runs(limit?)` | recent compact rows |
-| `get_verification_results(run_id)` | signed URLs + stage counts; partial for non-completed runs |
-| `resume_verification(run_id)` | resume failed/paused from last completed stage |
+| `get_verification_results(run_id)` | signed URLs + `resolved_counts` + `salvage_decision`; partial for non-completed runs |
+| `resume_verification(run_id)` | resume from last completed stage; refuses a third unmoving MV stall |
 | `export_all_sendable(run_ids)` | zip of SENDABLE CSVs → signed URL |
+
+**Salvage first.** Never start a fresh run on a file that already has a run until `get_verification_results` has been read. See [STALL_RECOVERY.md](STALL_RECOVERY.md).
 
 ## Resume & partial results
 
