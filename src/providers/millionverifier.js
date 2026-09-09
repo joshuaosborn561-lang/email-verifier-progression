@@ -2,6 +2,7 @@ import { parse } from 'csv-parse/sync';
 import { config } from '../config.js';
 import { VendorError, withRetry } from '../lib/retry.js';
 import { normalizeMvResult } from '../merge.js';
+import { shouldRecoverPartial } from '../mv-coverage.js';
 
 function sleep(ms, signal) {
   return new Promise((resolve, reject) => {
@@ -216,23 +217,105 @@ export async function resolveDownloadCsv(bodyText, contentType = '', { onProgres
   return { csvText: bodyText, delivery: 'raw' };
 }
 
+export async function fetchMvDownloadCsv(fileId, { onProgress, signal, fetchImpl = fetch } = {}) {
+  const downloadUrl =
+    `${config.millionVerifierBulkUrl}/download` +
+    `?key=${encodeURIComponent(config.millionVerifierApiKey)}` +
+    `&file_id=${encodeURIComponent(fileId)}` +
+    `&filter=all`;
+
+  throwIfAborted(signal);
+  const dlRes = await fetchImpl(downloadUrl, signal ? { signal } : undefined);
+  if (!dlRes.ok) {
+    const errText = await dlRes.text().catch(() => '');
+    throw new VendorError(
+      `MillionVerifier download HTTP ${dlRes.status}: ${errText.slice(0, 200)}`,
+      { status: dlRes.status, vendor: 'millionverifier' }
+    );
+  }
+  const contentType = String(dlRes.headers.get('content-type') || '');
+  const bodyText = await dlRes.text();
+  const resolved = await resolveDownloadCsv(bodyText, contentType, {
+    onProgress,
+    fileId,
+    fetchImpl,
+  });
+  return resolved.csvText;
+}
+
+function applyUnverifiedRemainder(results, counts, emails) {
+  if (!emails?.length) return { forwarded: 0 };
+  let forwarded = 0;
+  for (const raw of emails) {
+    const email = String(raw || '').trim().toLowerCase();
+    if (!email || results.has(email)) continue;
+    results.set(email, { result: 'unknown', quality: '', free: '', role: '', unverified: true });
+    counts.unknown += 1;
+    forwarded += 1;
+  }
+  return { forwarded };
+}
+
+function fileinfoTally(fileinfo) {
+  return (
+    Number(fileinfo?.ok || 0) +
+    Number(fileinfo?.catch_all || 0) +
+    Number(fileinfo?.unknown || 0) +
+    Number(fileinfo?.invalid || 0)
+  );
+}
+
 /**
  * Download + parse results for an existing MillionVerifier file_id (no re-upload / no re-charge).
+ * Polls fileinfo AND the download endpoint. A stall at >=90% recovers whatever
+ * rows the result file already has and forwards the rest to No2Bounce as unknown.
  */
 export async function downloadResultsByFileId(
   fileId,
-  { onProgress, signal, stageTimeoutMs, stallTimeoutMs } = {}
+  {
+    onProgress,
+    signal,
+    stageTimeoutMs,
+    stallTimeoutMs,
+    emails,
+    recoverPercent,
+    pollDelayMs,
+  } = {}
 ) {
   if (!fileId) throw new Error('fileId is required');
 
-  let delayMs = 5_000;
+  let delayMs = Number(pollDelayMs ?? 5_000);
   const maxDelay = 30_000;
   const overallMs = Number(stageTimeoutMs ?? config.mvStageTimeoutMs);
   const stallMs = Number(stallTimeoutMs ?? config.mvStallTimeoutMs);
+  const recoverAt = Number(recoverPercent ?? config.mvPartialRecoverPercent);
   const startedAt = Date.now();
   let lastProgressAt = Date.now();
   let lastKey = '';
   let fileinfo = null;
+  let recoveredPartial = null;
+
+  async function tryResultDownload(reason) {
+    try {
+      const csvText = await fetchMvDownloadCsv(fileId, { onProgress, signal });
+      const parsed = parseMvCsv(csvText);
+      if (onProgress && parsed.results.size) {
+        await onProgress(
+          `MillionVerifier result download (${reason}) file_id=${fileId}: parsed=${parsed.results.size}` +
+            ` ok=${parsed.counts.ok} catch_all=${parsed.counts.catch_all}` +
+            ` unknown=${parsed.counts.unknown} invalid=${parsed.counts.invalid}`
+        );
+      }
+      return parsed;
+    } catch (err) {
+      if (onProgress) {
+        await onProgress(
+          `MillionVerifier result download (${reason}) file_id=${fileId} not ready: ${err.message}`
+        );
+      }
+      return null;
+    }
+  }
 
   while (true) {
     throwIfAborted(signal);
@@ -268,18 +351,12 @@ export async function downloadResultsByFileId(
 
     fileinfo = value;
     const status = String(fileinfo.status || '').toLowerCase();
+    const percent = Number(fileinfo.percent ?? 0);
     const key = progressKey(fileinfo);
+    const stalled = key === lastKey && Date.now() - lastProgressAt > stallMs;
     if (key !== lastKey) {
       lastKey = key;
       lastProgressAt = Date.now();
-    } else if (Date.now() - lastProgressAt > stallMs) {
-      throw new VendorError(
-        `MillionVerifier stalled for ${Math.round(stallMs / 60000)}m on file_id=${fileId}` +
-          ` (status=${status}, percent=${fileinfo.percent ?? 0},` +
-          ` verified=${fileinfo.verified ?? 0}, unverified=${fileinfo.unverified ?? 0},` +
-          ` reverify=${fileinfo.reverify ?? 0}, result_counts=0:${Number(fileinfo.ok || 0) + Number(fileinfo.catch_all || 0) + Number(fileinfo.unknown || 0) + Number(fileinfo.invalid || 0)})`,
-        { transient: true, vendor: 'millionverifier' }
-      );
     }
 
     if (isMvFileFinished(fileinfo)) break;
@@ -290,9 +367,35 @@ export async function downloadResultsByFileId(
       });
     }
 
+    // fileinfo tallies stay 0:0 until the job is marked finished — poll download separately
+    if (percent >= recoverAt || stalled) {
+      const parsed = await tryResultDownload(stalled ? 'stall-probe' : 'progress-probe');
+      if (parsed?.results.size) {
+        const uniqueTarget = emails?.length || Number(fileinfo.unique_emails) || 0;
+        const verified = Number(fileinfo.verified) || 0;
+        const enough =
+          (uniqueTarget > 0 && parsed.results.size >= Math.floor(uniqueTarget * 0.9)) ||
+          (verified > 0 && parsed.results.size >= Math.floor(verified * 0.95));
+        if (enough || shouldRecoverPartial(fileinfo, { stalled, recoverPercent: recoverAt })) {
+          recoveredPartial = parsed;
+          break;
+        }
+      }
+    }
+
+    if (stalled) {
+      throw new VendorError(
+        `MillionVerifier stalled for ${Math.round(stallMs / 60000)}m on file_id=${fileId}` +
+          ` (status=${status}, percent=${percent},` +
+          ` verified=${fileinfo.verified ?? 0}, unverified=${fileinfo.unverified ?? 0},` +
+          ` reverify=${fileinfo.reverify ?? 0}, result_counts=${fileinfoTally(fileinfo)})`,
+        { transient: true, vendor: 'millionverifier' }
+      );
+    }
+
     if (onProgress) {
       await onProgress(
-        `MillionVerifier file_id=${fileId} status=${status} percent=${fileinfo.percent ?? 0}` +
+        `MillionVerifier file_id=${fileId} status=${status} percent=${percent}` +
           ` verified=${fileinfo.verified ?? 0} unverified=${fileinfo.unverified ?? 0}` +
           ` reverify=${fileinfo.reverify ?? 0}` +
           ` (ok=${fileinfo.ok ?? 0}, catch_all=${fileinfo.catch_all ?? 0}, unknown=${fileinfo.unknown ?? 0}, invalid=${fileinfo.invalid ?? 0})`
@@ -303,50 +406,45 @@ export async function downloadResultsByFileId(
     delayMs = Math.min(maxDelay, Math.round(delayMs * 1.4));
   }
 
-  if (!isMvFileFinished(fileinfo)) {
-    throw new VendorError(
-      `MillionVerifier polling ended before finished for file_id=${fileId}`,
-      { vendor: 'millionverifier' }
-    );
-  }
+  let results;
+  let counts;
+  let csvText = '';
+  let partial = Boolean(recoveredPartial);
 
-  const downloadUrl =
-    `${config.millionVerifierBulkUrl}/download` +
-    `?key=${encodeURIComponent(config.millionVerifierApiKey)}` +
-    `&file_id=${encodeURIComponent(fileId)}` +
-    `&filter=all`;
-
-  const { value: csvText } = await withRetry(async () => {
-    throwIfAborted(signal);
-    const dlRes = await fetch(downloadUrl, signal ? { signal } : undefined);
-    if (!dlRes.ok) {
-      const errText = await dlRes.text().catch(() => '');
+  if (recoveredPartial) {
+    results = recoveredPartial.results;
+    counts = recoveredPartial.counts;
+  } else {
+    if (!isMvFileFinished(fileinfo)) {
       throw new VendorError(
-        `MillionVerifier download HTTP ${dlRes.status}: ${errText.slice(0, 200)}`,
-        { status: dlRes.status, vendor: 'millionverifier' }
+        `MillionVerifier polling ended before finished for file_id=${fileId}`,
+        { vendor: 'millionverifier' }
       );
     }
-    const contentType = String(dlRes.headers.get('content-type') || '');
-    const bodyText = await dlRes.text();
-    const resolved = await resolveDownloadCsv(bodyText, contentType, {
-      onProgress,
-      fileId,
-    });
-    return resolved.csvText;
-  });
 
-  const { results, counts } = parseMvCsv(csvText);
+    const { value } = await withRetry(async () => fetchMvDownloadCsv(fileId, { onProgress, signal }));
+    csvText = value;
+    ({ results, counts } = parseMvCsv(csvText));
+  }
+
   const mergedCounts = {
-    ok: Number(fileinfo.ok ?? counts.ok),
-    catch_all: Number(fileinfo.catch_all ?? counts.catch_all),
-    unknown: Number(fileinfo.unknown ?? counts.unknown),
-    invalid: Number(fileinfo.invalid ?? counts.invalid),
+    ok: Number((!partial && fileinfo.ok) || counts.ok),
+    catch_all: Number((!partial && fileinfo.catch_all) || counts.catch_all),
+    unknown: Number((!partial && fileinfo.unknown) || counts.unknown),
+    invalid: Number((!partial && fileinfo.invalid) || counts.invalid),
   };
-  const fileinfoTotal =
-    mergedCounts.ok + mergedCounts.catch_all + mergedCounts.unknown + mergedCounts.invalid;
-  if (fileinfoTotal > 0 && results.size < Math.floor(fileinfoTotal * 0.95)) {
+  // Prefer parsed counts when fileinfo tallies are still 0
+  if (fileinfoTally(fileinfo) === 0) {
+    Object.assign(mergedCounts, counts);
+  }
+
+  const recovered = results.size;
+  const { forwarded } = applyUnverifiedRemainder(results, mergedCounts, emails);
+
+  const fileinfoTotal = fileinfoTally(fileinfo);
+  if (!partial && fileinfoTotal > 0 && recovered < Math.floor(fileinfoTotal * 0.95)) {
     throw new VendorError(
-      `MillionVerifier download incomplete for file_id=${fileId}: parsed ${results.size} rows vs fileinfo total ${fileinfoTotal} (csv bytes=${csvText.length})`,
+      `MillionVerifier download incomplete for file_id=${fileId}: parsed ${recovered} rows vs fileinfo total ${fileinfoTotal} (csv bytes=${csvText.length})`,
       { transient: true, vendor: 'millionverifier' }
     );
   }
@@ -354,10 +452,19 @@ export async function downloadResultsByFileId(
   const creditsUsed = computeMvCreditsUsed(fileinfo, mergedCounts);
 
   if (onProgress) {
-    await onProgress(
-      `MillionVerifier loaded file_id=${fileId}: ok=${mergedCounts.ok}, catch_all=${mergedCounts.catch_all}, ` +
-        `unknown=${mergedCounts.unknown}, invalid=${mergedCounts.invalid}, parsed=${results.size}, credits_used=${creditsUsed}`
-    );
+    if (partial) {
+      await onProgress(
+        `MillionVerifier recovered partial file_id=${fileId}: recovered=${recovered}, ` +
+          `forwarded_unverified_to_n2b=${forwarded}, ` +
+          `ok=${mergedCounts.ok}, catch_all=${mergedCounts.catch_all}, ` +
+          `unknown=${mergedCounts.unknown}, invalid=${mergedCounts.invalid}, credits_used=${creditsUsed}`
+      );
+    } else {
+      await onProgress(
+        `MillionVerifier loaded file_id=${fileId}: ok=${mergedCounts.ok}, catch_all=${mergedCounts.catch_all}, ` +
+          `unknown=${mergedCounts.unknown}, invalid=${mergedCounts.invalid}, parsed=${recovered}, credits_used=${creditsUsed}`
+      );
+    }
   }
 
   return {
@@ -366,6 +473,9 @@ export async function downloadResultsByFileId(
     creditsUsed,
     fileId: String(fileId),
     fileinfo,
+    partial,
+    recovered,
+    forwardedUnverified: forwarded,
   };
 }
 
@@ -437,5 +547,5 @@ export async function verifyBulk(
     await onProgress(`MillionVerifier uploaded file_id=${fileId} (${unique.length} unique emails)`);
   }
 
-  return downloadResultsByFileId(fileId, { onProgress, signal });
+  return downloadResultsByFileId(fileId, { onProgress, signal, emails: unique });
 }

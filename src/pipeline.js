@@ -10,6 +10,12 @@ import {
   upsertAddressResults,
 } from './db.js';
 import { mergeRunResults, resolveAddressOutcome } from './merge.js';
+import {
+  countMvMapVerdicts,
+  hasUsableMvCoverage,
+  isCorruptCompletedRun,
+  zeroVerdictsError,
+} from './mv-coverage.js';
 import { extractDomain, MAIL_CLASS, mxTagColumns, summarizeMailClasses } from './mx.js';
 import {
   downloadResultsByFileId,
@@ -153,7 +159,8 @@ function applyN2bToAddressRows(existingRows, n2bResults) {
 function mvMapFromAddressRows(rows) {
   const map = new Map();
   for (const row of rows) {
-    map.set(row.email, { result: row.mv_result || 'unknown' });
+    if (!row.mv_result) continue;
+    map.set(row.email, { result: row.mv_result });
   }
   return map;
 }
@@ -198,24 +205,29 @@ async function persistPartialCsvs(
 
   const sendablePath = `${runId}/${segment}_SENDABLE.csv`;
   const rejectedPath = `${runId}/${segment}_REJECTED.csv`;
+  const unresolvedPath = `${runId}/${segment}_UNRESOLVED.csv`;
   const sendableSegPath = `${runId}/${segment}_SENDABLE_SEG.csv`;
   const sendableOtherPath = `${runId}/${segment}_SENDABLE_OTHER.csv`;
 
   await uploadFile(config.resultsBucket, sendablePath, toCsv(sendable, outColumns));
   await uploadFile(config.resultsBucket, rejectedPath, toCsv(rejected, outColumns));
+  await uploadFile(config.resultsBucket, unresolvedPath, toCsv(merged.unresolved || [], outColumns));
   await uploadFile(config.resultsBucket, sendableSegPath, toCsv(merged.sendableSeg, outColumns));
   await uploadFile(config.resultsBucket, sendableOtherPath, toCsv(merged.sendableOther, outColumns));
 
   return {
     sendablePath,
     rejectedPath,
+    unresolvedPath,
     sendableSegPath,
     sendableOtherPath,
     sendableCount: sendable.length,
     rejectedCount: rejected.length,
+    unresolvedCount: (merged.unresolved || []).length,
     sendableSegCount: merged.sendableSeg.length,
     sendableOtherCount: merged.sendableOther.length,
     unresolvedAfterN2b: merged.unresolvedAfterN2b,
+    neverVerified: merged.neverVerified || 0,
     confirmedCount: merged.confirmedCount,
     unresolvedCatchallCount: merged.unresolvedCatchallCount,
   };
@@ -356,10 +368,20 @@ async function runMergeStage({
   n2bCredits,
   mxByEmail,
 }) {
+  const assessed = countMvMapVerdicts(mvResults).assessed;
+  if (records.length > 0 && assessed === 0) {
+    throw new Error(
+      zeroVerdictsError({
+        totalEmails: records.length || run.total_emails,
+        fileId: run.mv_file_id,
+      })
+    );
+  }
+
   await updateRun(runId, { status: 'merging' });
   await addLog(
     runId,
-    'Merging results into SENDABLE / REJECTED CSVs and campaign splits (SENDABLE_SEG vs SENDABLE_OTHER)'
+    'Merging results into SENDABLE / REJECTED / UNRESOLVED CSVs and campaign splits (SENDABLE_SEG vs SENDABLE_OTHER)'
   );
 
   const segment = sanitizeSegmentName(run.segment_name);
@@ -378,9 +400,11 @@ async function runMergeStage({
   for (const row of records) {
     const email = String(row[emailCol] || '').trim().toLowerCase();
     if (!email) continue;
-    const mv = mvResults.get(email)?.result || 'unknown';
+    const mvRow = mvResults.get(email);
+    const assessedRow = Boolean(mvRow?.result);
+    const mv = assessedRow ? mvRow.result : null;
     const n2b = n2bResults.get(email) || null;
-    const outcome = resolveAddressOutcome(mv, n2b);
+    const outcome = resolveAddressOutcome(mv, n2b, { assessed: assessedRow });
     addressRows.push(
       applyMxRecord(
         {
@@ -388,9 +412,8 @@ async function runMergeStage({
           mv_result: mv,
           n2b_status: n2b?.status ?? null,
           n2b_cohort: mv === 'catch_all' || mv === 'unknown' ? mv : null,
-          final_disposition:
-            outcome.final_disposition === 'pending' ? 'rejected' : outcome.final_disposition,
-          confidence: outcome.confidence || 'rejected',
+          final_disposition: outcome.final_disposition,
+          confidence: outcome.confidence || 'unverified',
           verification_source: outcome.verification_source,
         },
         mxByEmail.get(email)
@@ -407,9 +430,11 @@ async function runMergeStage({
     sendable_seg_count: merged.sendableSegCount,
     sendable_other_count: merged.sendableOtherCount,
     unresolved_after_n2b_count: merged.unresolvedAfterN2b,
+    unresolved_count: merged.unresolvedCount,
     n2b_credits_used: n2bCredits,
     sendable_path: merged.sendablePath,
     rejected_path: merged.rejectedPath,
+    unresolved_path: merged.unresolvedPath,
     sendable_seg_path: merged.sendableSegPath,
     sendable_other_path: merged.sendableOtherPath,
     completed_at: new Date().toISOString(),
@@ -421,7 +446,8 @@ async function runMergeStage({
     runId,
     `Completed — sendable=${merged.sendableCount} (seg=${merged.sendableSegCount}, other=${merged.sendableOtherCount}, ` +
       `confirmed=${merged.confirmedCount}, unresolved_catchall=${merged.unresolvedCatchallCount}), ` +
-      `rejected=${merged.rejectedCount}, unresolved_after_n2b=${merged.unresolvedAfterN2b}`
+      `rejected=${merged.rejectedCount}, unresolved=${merged.unresolvedCount}, ` +
+      `never_verified=${merged.neverVerified}, unresolved_after_n2b=${merged.unresolvedAfterN2b}`
   );
 }
 
@@ -517,12 +543,6 @@ export async function runPipeline(runId, { resume = false, signal } = {}) {
 
     stageCompleted = run.stage_completed || 'none';
     mvFileId = run.mv_file_id || null;
-    const canSkipMv =
-      resume &&
-      (stageCompleted === 'mv' ||
-        stageCompleted === 'n2b' ||
-        stageCompleted === 'merge' ||
-        Boolean(run.mv_file_id));
 
     if (!run.upload_path) {
       throw new Error('Run has no upload_path');
@@ -574,59 +594,36 @@ export async function runPipeline(runId, { resume = false, signal } = {}) {
     }
 
     // ── Stage 1: MillionVerifier ──────────────────────────────────────────
-    if (canSkipMv && (run.mv_file_id || stageCompleted !== 'none')) {
+    addressRows = await listAddressResults(runId);
+    const coverageOk = hasUsableMvCoverage({
+      addressRows,
+      run,
+      expectedCount: emails.length,
+    });
+    const reusePersistedMv =
+      resume &&
+      coverageOk &&
+      (stageCompleted === 'mv' || stageCompleted === 'n2b' || stageCompleted === 'merge');
+
+    if (reusePersistedMv) {
       await addLog(
         runId,
-        resume
-          ? `Resume: skipping MillionVerifier (stage_completed=${stageCompleted}, mv_file_id=${run.mv_file_id || 'n/a'})`
-          : `Reusing MillionVerifier results (mv_file_id=${run.mv_file_id})`
+        `Resume: reusing ${addressRows.length} persisted MillionVerifier verdicts (stage_completed=${stageCompleted}, no re-bill)`
       );
-
-      addressRows = await listAddressResults(runId);
-      const expectedMvRows = Math.max(
-        Number(run.total_emails) || 0,
-        (Number(run.mv_ok_count) || 0) +
-          (Number(run.mv_catch_all_count) || 0) +
-          (Number(run.mv_unknown_count) || 0) +
-          (Number(run.mv_invalid_count) || 0),
-        emails.length
-      );
-      const tallies = { ok: 0, catch_all: 0, unknown: 0, invalid: 0 };
-      for (const row of addressRows) {
-        if (tallies[row.mv_result] !== undefined) tallies[row.mv_result] += 1;
+      mvResults = mvMapFromAddressRows(addressRows);
+      for (const [email, mx] of mxMapFromAddressRows(addressRows)) {
+        if (!mxByEmail.has(email)) mxByEmail.set(email, mx);
       }
-      const tallyClose = (got, expected) => {
-        const exp = Number(expected) || 0;
-        if (exp === 0) return got === 0;
-        return Math.abs(got - exp) <= Math.max(25, Math.floor(exp * 0.05));
-      };
-      // Partial upserts OR truncated MV reloads leave wrong classifications — reload from MV file
-      const coverageOk =
-        addressRows.length > 0 &&
-        addressRows.length >= Math.floor(expectedMvRows * 0.95) &&
-        tallyClose(tallies.ok, run.mv_ok_count) &&
-        tallyClose(tallies.catch_all, run.mv_catch_all_count) &&
-        tallyClose(tallies.unknown, run.mv_unknown_count) &&
-        tallyClose(tallies.invalid, run.mv_invalid_count);
-
-      if (coverageOk) {
-        mvResults = mvMapFromAddressRows(addressRows);
-        for (const [email, mx] of mxMapFromAddressRows(addressRows)) {
-          if (!mxByEmail.has(email)) mxByEmail.set(email, mx);
-        }
-        await addLog(
-          runId,
-          `Resume: using ${addressRows.length} persisted address rows (expected ≈ ${expectedMvRows})`
-        );
-      } else if (run.mv_file_id) {
+    } else if (run.mv_file_id) {
         await updateRun(runId, { status: 'verifying_mv', last_error: null });
         await addLog(
           runId,
-          `Resume: address coverage incomplete (${addressRows.length}/${expectedMvRows}) — reloading MillionVerifier file_id=${run.mv_file_id} (no re-charge)`
+          `Reloading MillionVerifier file_id=${run.mv_file_id} (no re-upload / no re-bill; persisted verdicts=${coverageOk ? 'usable' : 'none'})`
         );
         const mv = await downloadResultsByFileId(run.mv_file_id, {
           onProgress: async (message) => addLog(runId, message),
           signal,
+          emails,
         });
         mvResults = mv.results;
         mvCredits = mv.creditsUsed;
@@ -658,12 +655,15 @@ export async function runPipeline(runId, { resume = false, signal } = {}) {
           mv_invalid_count: mv.counts.invalid,
           mv_credits_used: mvCredits || run.mv_credits_used,
           mv_file_id: mv.fileId,
+          mv_recovered_count: mv.recovered ?? mvResults.size,
           stage_completed: 'mv',
         });
         stageCompleted = 'mv';
-      } else {
-        throw new Error('Cannot resume: no persisted address results and no mv_file_id');
-      }
+        if (countMvMapVerdicts(mvResults).assessed === 0) {
+          throw new Error(
+            zeroVerdictsError({ totalEmails: emails.length, fileId: mv.fileId })
+          );
+        }
     } else {
       await updateRun(runId, { status: 'verifying_mv', last_error: null });
       await addLog(runId, 'Pipeline started (Stage 1 = MillionVerifier)');
@@ -725,6 +725,7 @@ export async function runPipeline(runId, { resume = false, signal } = {}) {
         mv_invalid_count: mv.counts.invalid,
         mv_credits_used: mvCredits,
         mv_file_id: mvFileId,
+        mv_recovered_count: mv.recovered ?? addressRows.length,
         stage_completed: 'mv',
         last_error: null,
         error_message: null,
@@ -732,8 +733,12 @@ export async function runPipeline(runId, { resume = false, signal } = {}) {
       stageCompleted = 'mv';
       await addLog(
         runId,
-        `Stage 1 complete and persisted (${addressRows.length} address rows). credits_used=${mvCredits}`
+        `Stage 1 complete and persisted (${addressRows.length} address rows). credits_used=${mvCredits}` +
+          (mv.partial ? ` recovered=${mv.recovered} forwarded_unverified=${mv.forwardedUnverified}` : '')
       );
+      if (countMvMapVerdicts(mvResults).assessed === 0) {
+        throw new Error(zeroVerdictsError({ totalEmails: emails.length, fileId: mvFileId }));
+      }
     }
 
     run = await (await import('./db.js')).getRun(runId);
@@ -858,10 +863,18 @@ export async function resumeVerification(runId, { force = false } = {}) {
     'verifying_n2b',
     'merging',
   ];
-  if (force && run.status === 'completed') {
-    // allow repair of completed-but-corrupt runs
+  const corruptCompleted = isCorruptCompletedRun(run);
+  if ((force || corruptCompleted) && run.status === 'completed') {
+    // Repair completed-but-empty MV runs. A resume that cannot recover
+    // prior work will fail again instead of inventing a clean rejection.
   } else if (!resumable.includes(run.status)) {
     throw new Error(`Cannot resume run in status ${run.status}`);
+  }
+
+  if (corruptCompleted && !run.mv_file_id) {
+    throw new Error(
+      'Cannot resume: this completed run has zero MillionVerifier verdicts and no mv_file_id to reload'
+    );
   }
 
   const resume =
@@ -955,6 +968,8 @@ export async function buildResultsPayload(run) {
     mail_class_unknown_count: run.mail_class_unknown_count ?? 0,
     sendable_seg_count: run.sendable_seg_count ?? 0,
     sendable_other_count: run.sendable_other_count ?? 0,
+    unresolved_count: run.unresolved_count ?? 0,
+    mv_recovered_count: run.mv_recovered_count ?? 0,
   };
 
   let addressCounts = null;
@@ -981,20 +996,25 @@ export async function buildResultsPayload(run) {
 
   if (run.sendable_path && run.rejected_path) {
     const { createSignedUrl } = await import('./storage.js');
-    const [sendable_url, rejected_url, sendable_seg_url, sendable_other_url] = await Promise.all([
-      createSignedUrl(config.resultsBucket, run.sendable_path),
-      createSignedUrl(config.resultsBucket, run.rejected_path),
-      run.sendable_seg_path
-        ? createSignedUrl(config.resultsBucket, run.sendable_seg_path)
-        : Promise.resolve(null),
-      run.sendable_other_path
-        ? createSignedUrl(config.resultsBucket, run.sendable_other_path)
-        : Promise.resolve(null),
-    ]);
+    const [sendable_url, rejected_url, sendable_seg_url, sendable_other_url, unresolved_url] =
+      await Promise.all([
+        createSignedUrl(config.resultsBucket, run.sendable_path),
+        createSignedUrl(config.resultsBucket, run.rejected_path),
+        run.sendable_seg_path
+          ? createSignedUrl(config.resultsBucket, run.sendable_seg_path)
+          : Promise.resolve(null),
+        run.sendable_other_path
+          ? createSignedUrl(config.resultsBucket, run.sendable_other_path)
+          : Promise.resolve(null),
+        run.unresolved_path
+          ? createSignedUrl(config.resultsBucket, run.unresolved_path)
+          : Promise.resolve(null),
+      ]);
     payload.sendable_url = sendable_url;
     payload.rejected_url = rejected_url;
     if (sendable_seg_url) payload.sendable_seg_url = sendable_seg_url;
     if (sendable_other_url) payload.sendable_other_url = sendable_other_url;
+    if (unresolved_url) payload.unresolved_url = unresolved_url;
   } else if (partial && addressCounts && addressCounts.total > 0) {
     // Generate partial CSVs from persisted address rows + original upload
     try {
@@ -1028,28 +1048,34 @@ export async function buildResultsPayload(run) {
       await updateRun(run.id, {
         sendable_path: files.sendablePath,
         rejected_path: files.rejectedPath,
+        unresolved_path: files.unresolvedPath,
         sendable_seg_path: files.sendableSegPath,
         sendable_other_path: files.sendableOtherPath,
         final_sendable_count: files.sendableCount,
         final_rejected_count: files.rejectedCount,
+        unresolved_count: files.unresolvedCount,
         sendable_seg_count: files.sendableSegCount,
         sendable_other_count: files.sendableOtherCount,
       });
       const { createSignedUrl } = await import('./storage.js');
-      const [sendable_url, rejected_url, sendable_seg_url, sendable_other_url] = await Promise.all([
-        createSignedUrl(config.resultsBucket, files.sendablePath),
-        createSignedUrl(config.resultsBucket, files.rejectedPath),
-        createSignedUrl(config.resultsBucket, files.sendableSegPath),
-        createSignedUrl(config.resultsBucket, files.sendableOtherPath),
-      ]);
+      const [sendable_url, rejected_url, sendable_seg_url, sendable_other_url, unresolved_url] =
+        await Promise.all([
+          createSignedUrl(config.resultsBucket, files.sendablePath),
+          createSignedUrl(config.resultsBucket, files.rejectedPath),
+          createSignedUrl(config.resultsBucket, files.sendableSegPath),
+          createSignedUrl(config.resultsBucket, files.sendableOtherPath),
+          createSignedUrl(config.resultsBucket, files.unresolvedPath),
+        ]);
       payload.sendable_url = sendable_url;
       payload.rejected_url = rejected_url;
       payload.sendable_seg_url = sendable_seg_url;
       payload.sendable_other_url = sendable_other_url;
+      payload.unresolved_url = unresolved_url;
       payload.final_sendable_count = files.sendableCount;
       payload.final_rejected_count = files.rejectedCount;
+      payload.unresolved_count = files.unresolvedCount;
       payload.partial_note =
-        'Partial results from completed stages only; addresses awaiting No2Bounce are listed under rejected/pending.';
+        'Partial results from completed stages only; addresses never assessed or still awaiting No2Bounce are listed under unresolved.';
     } catch (err) {
       payload.partial_note = `Address-level results available in DB; CSV generation deferred: ${err.message}`;
     }

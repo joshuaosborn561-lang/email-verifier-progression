@@ -179,6 +179,7 @@ export async function countAddressResultsByDisposition(runId) {
     pending: 0,
     sendable: 0,
     rejected: 0,
+    unresolved: 0,
     mv_ok: 0,
     mv_catch_all: 0,
     mv_unknown: 0,
@@ -194,6 +195,7 @@ export async function countAddressResultsByDisposition(runId) {
   for (const row of rows) {
     if (row.final_disposition === 'sendable') counts.sendable += 1;
     else if (row.final_disposition === 'rejected') counts.rejected += 1;
+    else if (row.final_disposition === 'unresolved') counts.unresolved += 1;
     else counts.pending += 1;
 
     if (row.mv_result === 'ok') counts.mv_ok += 1;

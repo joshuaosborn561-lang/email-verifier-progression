@@ -41,6 +41,12 @@ export const config = {
   mvStageTimeoutMs: Number(process.env.MV_STAGE_TIMEOUT_MS || 45 * 60 * 1000),
   /** Fail if percent/verified make no progress for this long (default 12m). */
   mvStallTimeoutMs: Number(process.env.MV_STALL_TIMEOUT_MS || 12 * 60 * 1000),
+  /**
+   * After this percent, poll the result download even while fileinfo
+   * tallies are still 0. On stall at or above this percent, keep the
+   * partial file and send the remainder to No2Bounce (default 90).
+   */
+  mvPartialRecoverPercent: Number(process.env.MV_PARTIAL_RECOVER_PERCENT || 90),
   /** Max time for a No2Bounce cohort batch poll (default 45m). */
   n2bStageTimeoutMs: Number(process.env.N2B_STAGE_TIMEOUT_MS || 45 * 60 * 1000),
   uploadsBucket: 'verification-uploads',

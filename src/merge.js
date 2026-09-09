@@ -16,7 +16,17 @@ import { campaignSplit, MAIL_CLASS } from './mx.js';
  *   - no verdict / unknown → rejected + unresolved_after_n2b
  *   - other N2B reject → rejected
  */
-export function resolveAddressOutcome(mvResult, n2bResult) {
+export function resolveAddressOutcome(mvResult, n2bResult, { assessed = true } = {}) {
+  if (!assessed) {
+    return {
+      final_disposition: 'unresolved',
+      confidence: 'unverified',
+      verification_source: null,
+      verification_status: 'never_verified',
+      unresolved_after_n2b: false,
+    };
+  }
+
   const mv = String(mvResult || 'unknown').toLowerCase();
 
   if (mv === 'ok') {
@@ -106,17 +116,20 @@ function attachMxTags(out, mx) {
 export function mergeRunResults({ records, emailCol, mvResults, n2bResults, mxByEmail }) {
   const sendable = [];
   const rejected = [];
+  const unresolved = [];
   const sendableSeg = [];
   const sendableOther = [];
   let confirmedCount = 0;
   let unresolvedCatchallCount = 0;
   let unresolvedAfterN2b = 0;
+  let neverVerified = 0;
 
   for (const row of records) {
     const email = String(row[emailCol] || '').trim().toLowerCase();
-    const mvRow = mvResults.get(email) || { result: 'unknown' };
-    const n2b = n2bResults.get(email) || null;
-    const outcome = resolveAddressOutcome(mvRow.result, n2b);
+    const mvRow = mvResults?.get(email) || null;
+    const assessed = Boolean(mvRow && mvRow.result);
+    const n2b = n2bResults?.get(email) || null;
+    const outcome = resolveAddressOutcome(mvRow?.result, n2b, { assessed });
     const mx = mxByEmail?.get(email) || null;
 
     const out = attachMxTags(
@@ -124,7 +137,7 @@ export function mergeRunResults({ records, emailCol, mvResults, n2bResults, mxBy
         ...row,
         verification_source: outcome.verification_source,
         verification_status: outcome.verification_status,
-        confidence: outcome.confidence || 'rejected',
+        confidence: outcome.confidence || (outcome.final_disposition === 'unresolved' ? 'unverified' : 'rejected'),
       },
       mx
     );
@@ -135,10 +148,13 @@ export function mergeRunResults({ records, emailCol, mvResults, n2bResults, mxBy
       else sendableOther.push(out);
       if (outcome.confidence === 'confirmed') confirmedCount += 1;
       if (outcome.confidence === 'unresolved_catchall') unresolvedCatchallCount += 1;
+    } else if (outcome.final_disposition === 'unresolved') {
+      unresolved.push(out);
+      neverVerified += 1;
     } else if (outcome.final_disposition === 'pending') {
-      // Treat unresolved pending at merge time as rejected (should not happen if N2B ran)
-      out.confidence = 'rejected';
-      rejected.push(out);
+      // Assessed catch_all/unknown still waiting on N2B — not a silent reject of unverified rows
+      out.confidence = 'pending';
+      unresolved.push(out);
       unresolvedAfterN2b += 1;
     } else {
       rejected.push(out);
@@ -149,11 +165,13 @@ export function mergeRunResults({ records, emailCol, mvResults, n2bResults, mxBy
   return {
     sendable,
     rejected,
+    unresolved,
     sendableSeg,
     sendableOther,
     confirmedCount,
     unresolvedCatchallCount,
     unresolvedAfterN2b,
+    neverVerified,
   };
 }
 

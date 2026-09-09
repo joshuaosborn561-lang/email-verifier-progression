@@ -30,6 +30,8 @@ function summarizeRun(run) {
     n2b_unknown_candidates: run.n2b_unknown_candidates ?? 0,
     n2b_unknown_deliverable: run.n2b_unknown_deliverable ?? 0,
     unresolved_after_n2b_count: run.unresolved_after_n2b_count ?? 0,
+    unresolved_count: run.unresolved_count ?? 0,
+    mv_recovered_count: run.mv_recovered_count ?? 0,
     mail_class_seg_count: run.mail_class_seg_count ?? 0,
     mail_class_native_count: run.mail_class_native_count ?? 0,
     mail_class_direct_count: run.mail_class_direct_count ?? 0,
@@ -110,6 +112,8 @@ export function createMcpServer() {
         n2b_unknown_candidates: run.n2b_unknown_candidates ?? 0,
         n2b_unknown_deliverable: run.n2b_unknown_deliverable ?? 0,
         unresolved_after_n2b_count: run.unresolved_after_n2b_count ?? 0,
+        unresolved_count: run.unresolved_count ?? 0,
+        mv_recovered_count: run.mv_recovered_count ?? 0,
         mail_class_seg_count: run.mail_class_seg_count ?? 0,
         mail_class_native_count: run.mail_class_native_count ?? 0,
         mail_class_direct_count: run.mail_class_direct_count ?? 0,
@@ -152,13 +156,14 @@ export function createMcpServer() {
 
   server.tool(
     'resume_verification',
-    'Resume a failed, paused, queued, or stuck in-progress run (classifying_mx / verifying_mv / verifying_n2b / merging) from the last completed stage. Does not re-run MillionVerifier when mv_file_id or address results already exist. Re-runs free MX tagging only for addresses that still lack a mail_class.',
+    'Resume a failed, paused, queued, stuck, or completed-but-corrupt run (zero MV verdicts) from the last completed stage. Reloads an existing mv_file_id without re-uploading or re-billing. Never merges unverified rows as rejected.',
     {
       run_id: z.string().uuid(),
+      force: z.boolean().optional().describe('Also resume a completed run that is not obviously corrupt'),
     },
-    async ({ run_id }) => {
+    async ({ run_id, force }) => {
       try {
-        const run = await resumeVerification(run_id);
+        const run = await resumeVerification(run_id, { force: Boolean(force) });
         return textResult({
           run_id: run.id,
           status: run.status,

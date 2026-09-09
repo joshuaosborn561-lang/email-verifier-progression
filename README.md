@@ -31,6 +31,8 @@ Domain answers are persisted in `domain_mx_cache` and reused across clients and 
 | `PORT` | Optional (default `3000`) |
 | `PUBLIC_URL` | Optional public base URL |
 | `N2B_SUBMIT_BATCH_SIZE` | Optional No2Bounce submit chunk size (default `150`) |
+| `MV_STALL_TIMEOUT_MS` | Fail/recover if MV progress is unchanged this long (default `720000` = 12m) |
+| `MV_PARTIAL_RECOVER_PERCENT` | Start polling the MV result file and recover a stall at or above this percent (default `90`) |
 
 ## Local run
 
@@ -58,6 +60,8 @@ Endpoint: `POST /mcp` (Streamable HTTP). Responses are summary-only — never fu
 ## Resume & partial results
 
 Per-address MillionVerifier results are persisted before No2Bounce starts. Failed or paused runs keep that work; `resume_verification` continues from `stage_completed` (`none` → `mx` → `mv` → `n2b` → `merge`) and will not re-bill MillionVerifier when `mv_file_id` / address rows already exist. MX tagging is free and is skipped for addresses that already have a `mail_class`.
+
+A run where MillionVerifier produced **no verdicts** ends `failed` with `last_error` — never `completed` with everyone rejected. Rows the verifier never assessed land in `_UNRESOLVED.csv`. If MillionVerifier stalls at ≥90% (`MV_PARTIAL_RECOVER_PERCENT`, default 90; stall window `MV_STALL_TIMEOUT_MS`, default 12m), the result file is downloaded and the unverified remainder is sent to No2Bounce as `unknown`.
 
 `get_verification_results` returns `{ partial: true, ... }` for failed, paused, and in-progress runs, with per-stage counts and any downloadable partial CSVs.
 
