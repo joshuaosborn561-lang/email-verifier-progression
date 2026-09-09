@@ -10,6 +10,7 @@ import {
   resumeVerification,
   startVerificationFromUrl,
 } from './pipeline.js';
+import { usefulOutputCount } from './salvage.js';
 
 function summarizeRun(run) {
   return {
@@ -38,6 +39,7 @@ function summarizeRun(run) {
     mail_class_unknown_count: run.mail_class_unknown_count ?? 0,
     sendable_seg_count: run.sendable_seg_count ?? 0,
     sendable_other_count: run.sendable_other_count ?? 0,
+    useful_output_count: usefulOutputCount(run),
     stage_completed: run.stage_completed || 'none',
     last_error: run.last_error || run.error_message || null,
     retry_count: run.retry_count ?? 0,
@@ -62,35 +64,52 @@ export function createMcpServer() {
     'start_verification',
     [
       'Start a FULL email verification waterfall from a CSV file URL.',
+      'RULE: never start a fresh run on a file that already has a run until you have called get_verification_results on that prior run and read resolved_counts / salvage_decision.',
+      'A failed run is not empty. Restarting without that check re-bills MillionVerifier for addresses already paid.',
+      'If a prior run exists, pass prior_run_id. The server refuses the start when salvage_decision.action is resume or salvage unless force_fresh=true.',
+      'force_fresh is only valid when resolved_counts shows every MV verdict count at 0 (action=fresh_ok). Re-export from the client table first so deletions are not re-verified.',
       'Always runs end-to-end: (0) free MX lookup tags each contact (seg / native_filter / direct / unknown) — nothing is dropped;',
       '(1) MillionVerifier classifies ok/catch_all/unknown/invalid,',
       '(2) catch_all AND unknown are sent to No2Bounce,',
-      '(3) final SENDABLE = MV ok + No2Bounce-confirmed catch_alls + No2Bounce-confirmed unknowns;',
-      'final REJECTED = MV invalid + No2Bounce rejects / unresolved.',
-      'Campaign staging also writes SENDABLE_SEG (third-party gateway) and SENDABLE_OTHER (everyone else) — same copy, separate campaign.',
-      'Does NOT stop after MillionVerifier. Does NOT filter or suppress gateway-protected contacts.',
-      'Returns immediately with run_id — poll get_verification_status until status=completed, then get_verification_results for the final files.',
-      'Never returns per-email results.',
+      '(3) final SENDABLE = MV ok + No2Bounce-confirmed catch_alls + No2Bounce-confirmed unknowns.',
+      'Report useful_output_count (verified sendable), never rows submitted.',
+      'Returns immediately with run_id. Never returns per-email results.',
     ].join(' '),
     {
       file_url: z.string().url().describe('Publicly accessible URL to a CSV with an Email column'),
       segment_name: z.string().min(1).describe('Segment / list name for this run'),
+      prior_run_id: z
+        .string()
+        .uuid()
+        .optional()
+        .describe('Failed/paused run for this same file. Required whenever one exists. Server reads resolved_counts before starting.'),
+      force_fresh: z
+        .boolean()
+        .optional()
+        .describe('Override only when salvage_decision.action is fresh_ok (zero MV verdicts). Never use to skip salvage.'),
     },
-    async ({ file_url, segment_name }) => {
-      const run = await startVerificationFromUrl(file_url, segment_name);
-      return textResult({
-        run_id: run.id,
-        status: run.status,
-        segment_name: run.segment_name,
-        waterfall: 'mx-tag -> millionverifier -> no2bounce(catch_all+unknown) -> merge sendable/rejected + seg/other split',
-        note: 'MX tagging is free and never drops contacts. Pipeline continues automatically through No2Bounce and final merge. Poll until status=completed.',
-      });
+    async ({ file_url, segment_name, prior_run_id, force_fresh }) => {
+      try {
+        const run = await startVerificationFromUrl(file_url, segment_name, {
+          priorRunId: prior_run_id || null,
+          forceFresh: Boolean(force_fresh),
+        });
+        return textResult({
+          run_id: run.id,
+          status: run.status,
+          segment_name: run.segment_name,
+          waterfall: 'mx-tag -> millionverifier -> no2bounce(catch_all+unknown) -> merge sendable/rejected + seg/other split',
+          note: 'MX tagging is free and never drops contacts. Pipeline continues automatically through No2Bounce and final merge. Poll until status=completed. Report useful_output_count, not rows submitted.',
+        });
+      } catch (err) {
+        return textResult({ error: err.message });
+      }
     }
   );
 
   server.tool(
     'get_verification_status',
-    'Get compact status for a verification run. Summary fields only — no per-email data.',
+    'Get compact status for a verification run. Summary fields only — no per-email data. On failed/paused/stuck runs this is step 1 of the salvage ladder: read stage_completed, retry_count, last_error (MV file_id/percent/verified), and credits. Then you MUST call get_verification_results and read resolved_counts / salvage_decision before start_verification. useful_output_count is verified sendable addresses — never report rows submitted as success.',
     {
       run_id: z.string().uuid(),
     },
@@ -120,9 +139,14 @@ export function createMcpServer() {
         mail_class_unknown_count: run.mail_class_unknown_count ?? 0,
         sendable_seg_count: run.sendable_seg_count ?? 0,
         sendable_other_count: run.sendable_other_count ?? 0,
+        useful_output_count: usefulOutputCount(run),
         stage_completed: run.stage_completed || 'none',
         last_error: run.last_error || run.error_message || null,
         retry_count: run.retry_count ?? 0,
+        next_step:
+          run.status === 'completed'
+            ? null
+            : 'Call get_verification_results and read resolved_counts / salvage_decision before start_verification or a third resume.',
       });
     }
   );
@@ -143,7 +167,7 @@ export function createMcpServer() {
 
   server.tool(
     'get_verification_results',
-    'Return SENDABLE/REJECTED download URLs and stage counts. Completed runs return full results; failed/paused/in-progress runs return partial results labeled as such.',
+    'REQUIRED before starting a fresh run on a file that already has a run. Returns SENDABLE/REJECTED URLs, resolved_counts, and salvage_decision. A failed run is not empty — read salvage_decision.action: fresh_ok (safe to re-export and restart), resume (do not restart; MV already paid), salvage (ingest sendable+rejected, remainder only), done. Signed URLs expire in one hour. Never dump per-email rows into chat.',
     {
       run_id: z.string().uuid(),
     },
@@ -156,11 +180,13 @@ export function createMcpServer() {
 
   server.tool(
     'resume_verification',
-    'Resume a failed, paused, queued, stuck, or completed-but-corrupt run (zero MV verdicts) from the last completed stage. Reloads an existing mv_file_id without re-uploading or re-billing. Never merges unverified rows as rejected.',
+    'Resume a failed, paused, queued, stuck, or completed-but-corrupt run from the last completed stage. Reloads mv_file_id without re-billing. Resume once; a second resume only if percent/verified moved. A third resume on an unmoving stall (same file_id/percent/verified, retry_count>=2) is refused — call get_verification_results instead. Never merges unverified rows as rejected.',
     {
       run_id: z.string().uuid(),
-      force: z.boolean().optional().describe('Also resume a completed run that is not obviously corrupt'),
-    },
+      force: z
+        .boolean()
+        .optional()
+        .describe('Override the unmoving-stall cap or resume a completed run. Only after reading salvage_decision.'),
     async ({ run_id, force }) => {
       try {
         const run = await resumeVerification(run_id, { force: Boolean(force) });

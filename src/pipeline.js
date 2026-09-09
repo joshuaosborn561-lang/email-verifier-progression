@@ -6,6 +6,7 @@ import {
   countAddressResultsByDisposition,
   getTodayCreditsUsed,
   listAddressResults,
+  listRuns,
   updateRun,
   upsertAddressResults,
 } from './db.js';
@@ -16,6 +17,11 @@ import {
   isCorruptCompletedRun,
   zeroVerdictsError,
 } from './mv-coverage.js';
+import {
+  salvageDecision,
+  shouldRefuseUnmovingResume,
+  unmovingStallResumeError,
+} from './salvage.js';
 import { extractDomain, MAIL_CLASS, mxTagColumns, summarizeMailClasses } from './mx.js';
 import {
   downloadResultsByFileId,
@@ -853,6 +859,9 @@ export async function resumeVerification(runId, { force = false } = {}) {
   const { getRun } = await import('./db.js');
   const run = await getRun(runId);
   if (!run) throw new Error('Run not found');
+  if (shouldRefuseUnmovingResume(run, { force })) {
+    throw new Error(unmovingStallResumeError(run));
+  }
   // Include in-progress statuses — hung verifying_mv runs must be recoverable
   const resumable = [
     'failed',
@@ -895,12 +904,49 @@ export async function resumeVerification(runId, { force = false } = {}) {
   return getRun(runId);
 }
 
+async function assertFreshStartAllowed({ segmentName, priorRunId, forceFresh = false }) {
+  if (priorRunId) {
+    const { getRun } = await import('./db.js');
+    const prior = await getRun(priorRunId);
+    let resolvedCounts = null;
+    try {
+      resolvedCounts = await countAddressResultsByDisposition(priorRunId);
+    } catch {
+      resolvedCounts = null;
+    }
+    const decision = salvageDecision({ run: prior, resolvedCounts });
+    if ((decision.action === 'resume' || decision.action === 'salvage') && !forceFresh) {
+      throw new Error(
+        `Refusing a fresh run. prior_run_id=${priorRunId} salvage_decision.action=${decision.action}: ${decision.reason} ` +
+          'Call resume_verification or ingest sendable/rejected first. ' +
+          'Pass force_fresh=true only when resolved_counts shows nothing to salvage.'
+      );
+    }
+  }
+
+  const recent = await listRuns(20);
+  const active = recent.find(
+    (r) =>
+      r.segment_name === segmentName &&
+      !['completed', 'failed', 'paused'].includes(r.status)
+  );
+  if (active && !forceFresh) {
+    throw new Error(
+      `Segment "${segmentName}" already has run ${active.id} in status ${active.status}. ` +
+        'Do not start a duplicate. Call get_verification_results on that run_id first.'
+    );
+  }
+}
+
 export async function startVerificationFromBuffer({
   buffer,
   segmentName,
   filename = 'upload.csv',
+  priorRunId = null,
+  forceFresh = false,
 }) {
   const segment = sanitizeSegmentName(segmentName || filename);
+  await assertFreshStartAllowed({ segmentName: segment, priorRunId, forceFresh });
   const { records } = parseCsv(buffer);
   const runIdPlaceholder = randomUUID();
   const uploadPath = `${runIdPlaceholder}/${segment}.csv`;
@@ -930,13 +976,15 @@ export async function startVerificationFromBuffer({
   return run;
 }
 
-export async function startVerificationFromUrl(fileUrl, segmentName) {
+export async function startVerificationFromUrl(fileUrl, segmentName, opts = {}) {
   const { downloadFromUrl } = await import('./storage.js');
   const buffer = await downloadFromUrl(fileUrl);
   return startVerificationFromBuffer({
     buffer,
     segmentName,
     filename: `${segmentName}.csv`,
+    priorRunId: opts.priorRunId || null,
+    forceFresh: Boolean(opts.forceFresh),
   });
 }
 
@@ -992,6 +1040,7 @@ export async function buildResultsPayload(run) {
     retry_count: run.retry_count ?? 0,
     ...stageCounts,
     resolved_counts: addressCounts,
+    salvage_decision: salvageDecision({ run, resolvedCounts: addressCounts }),
   };
 
   if (run.sendable_path && run.rejected_path) {

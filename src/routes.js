@@ -81,6 +81,8 @@ export function createApiRouter() {
           buffer: file.buffer,
           segmentName: segment,
           filename: file.originalname,
+          priorRunId: req.body.prior_run_id || null,
+          forceFresh: req.body.force_fresh === '1' || req.body.force_fresh === true,
         });
         runs.push({
           run_id: run.id,
