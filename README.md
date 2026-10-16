@@ -35,6 +35,8 @@ Domain answers are persisted in `domain_mx_cache` and reused across clients and 
 | `MV_STALL_TIMEOUT_MS` | Fail/recover if MV progress is unchanged this long (default `720000` = 12m) |
 | `MV_PARTIAL_RECOVER_PERCENT` | Start polling the MV result file and recover a stall at or above this percent (default `90`) |
 
+Node **22+** is required (`engines.node` and `.node-version`). Railway builds with Railpack (`railway.toml`).
+
 ## Local run
 
 ```bash

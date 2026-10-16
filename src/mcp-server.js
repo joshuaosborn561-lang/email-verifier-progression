@@ -187,6 +187,7 @@ export function createMcpServer() {
         .boolean()
         .optional()
         .describe('Override the unmoving-stall cap or resume a completed run. Only after reading salvage_decision.'),
+    },
     async ({ run_id, force }) => {
       try {
         const run = await resumeVerification(run_id, { force: Boolean(force) });
