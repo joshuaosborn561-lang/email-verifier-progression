@@ -34,6 +34,14 @@ export const config = {
   n2bDailyCreditCeiling: Number(process.env.N2B_DAILY_CREDIT_CEILING || 0),
   /** No2Bounce submit batch size — large payloads (~1000+) trigger vendor 500s. */
   n2bSubmitBatchSize: Number(process.env.N2B_SUBMIT_BATCH_SIZE || 150),
+  /**
+   * How many No2Bounce batches to submit+poll at once (default 3, cap 6).
+   * Catch-all and unknown cohorts each use this limit.
+   */
+  n2bParallelBatches: Math.min(
+    6,
+    Math.max(1, Number(process.env.N2B_PARALLEL_BATCHES || 3) || 3)
+  ),
   vendorMaxAttempts: Number(process.env.VENDOR_MAX_ATTEMPTS || 5),
   vendorRetryBaseMs: Number(process.env.VENDOR_RETRY_BASE_MS || 2_000),
   mvBalanceFractionCeiling: Number(process.env.MV_BALANCE_FRACTION_CEILING || 0),

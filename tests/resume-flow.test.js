@@ -78,6 +78,35 @@ describe('mid-No2Bounce failure then resume', () => {
     assert.ok(merged.sendable.some((r) => r.Email === 'u1@ex.com'));
     assert.ok(merged.rejected.some((r) => r.Email === 'c2@ex.com'));
   });
+
+  it('keeps already-saved batches when a later batch finishes first', () => {
+    const rows = [
+      { email: 'c0@ex.com', mv_result: 'catch_all', n2b_status: null, n2b_cohort: 'catch_all' },
+      { email: 'c1@ex.com', mv_result: 'catch_all', n2b_status: null, n2b_cohort: 'catch_all' },
+      { email: 'u0@ex.com', mv_result: 'unknown', n2b_status: null, n2b_cohort: 'unknown' },
+    ];
+
+    const apply = (existing, batch) =>
+      existing.map((row) => {
+        const n2b = batch.get(row.email);
+        if (!n2b) return row;
+        return { ...row, n2b_status: n2b.status };
+      });
+
+    const lateFirst = new Map([['u0@ex.com', { status: 'Deliverable' }]]);
+    const earlierSecond = new Map([
+      ['c0@ex.com', { status: 'Deliverable' }],
+      ['c1@ex.com', { status: 'Undeliverable' }],
+    ]);
+
+    const afterOutOfOrder = apply(apply(rows, lateFirst), earlierSecond);
+    assert.equal(afterOutOfOrder.find((r) => r.email === 'u0@ex.com').n2b_status, 'Deliverable');
+    assert.equal(afterOutOfOrder.find((r) => r.email === 'c0@ex.com').n2b_status, 'Deliverable');
+    assert.equal(afterOutOfOrder.find((r) => r.email === 'c1@ex.com').n2b_status, 'Undeliverable');
+
+    const pending = afterOutOfOrder.filter((r) => !r.n2b_status).map((r) => r.email);
+    assert.deepEqual(pending, []);
+  });
 });
 
 describe('partial results payload shape for failed runs', () => {
