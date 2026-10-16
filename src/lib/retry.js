@@ -25,6 +25,35 @@ export function isTransientError(err) {
   );
 }
 
+function errorStatus(err) {
+  return Number(err?.status || err?.statusCode || 0);
+}
+
+export function isRateOrServerError(err) {
+  const status = errorStatus(err);
+  return status === 429 || (status >= 500 && status < 600);
+}
+
+/**
+ * Exponential backoff. 429/5xx use equal jitter so parallel workers
+ * do not retry in lockstep.
+ */
+export function retryDelayMs(
+  attempt,
+  {
+    baseDelayMs = 2_000,
+    maxDelayMs = 60_000,
+    jitter = false,
+    random = Math.random,
+  } = {}
+) {
+  const exp = Math.min(maxDelayMs, Math.round(baseDelayMs * 2 ** Math.max(0, attempt - 1)));
+  if (!jitter) return exp;
+  const unit = Math.max(0, Number(random()) || 0);
+  const mixed = Math.round(exp * (0.5 + Math.min(1, unit) * 0.5));
+  return Math.min(maxDelayMs, Math.max(0, mixed));
+}
+
 /**
  * Retry an async fn with exponential backoff on transient errors.
  * Returns { value, attempts }.
@@ -49,7 +78,11 @@ export async function withRetry(
       if (attempt >= maxAttempts || !shouldRetry(err)) {
         throw err;
       }
-      const delay = Math.min(maxDelayMs, Math.round(baseDelayMs * 2 ** (attempt - 1)));
+      const delay = retryDelayMs(attempt, {
+        baseDelayMs,
+        maxDelayMs,
+        jitter: isRateOrServerError(err),
+      });
       if (onRetry) {
         await onRetry({ attempt, maxAttempts, delay, error: err });
       }

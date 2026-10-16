@@ -31,8 +31,11 @@ Domain answers are persisted in `domain_mx_cache` and reused across clients and 
 | `PORT` | Optional (default `3000`) |
 | `PUBLIC_URL` | Optional public base URL |
 | `N2B_SUBMIT_BATCH_SIZE` | Optional No2Bounce submit chunk size (default `150`) |
+| `N2B_PARALLEL_BATCHES` | Optional No2Bounce batches in flight per cohort (default `3`, cap `6`) |
 | `MV_STALL_TIMEOUT_MS` | Fail/recover if MV progress is unchanged this long (default `720000` = 12m) |
 | `MV_PARTIAL_RECOVER_PERCENT` | Start polling the MV result file and recover a stall at or above this percent (default `90`) |
+
+Node **22+** is required (`engines.node` and `.node-version`). Railway builds with Railpack (`railway.toml`).
 
 ## Local run
 

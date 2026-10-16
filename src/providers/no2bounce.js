@@ -38,6 +38,46 @@ export function chunkEmails(emails, batchSize = config.n2bSubmitBatchSize) {
   return chunks;
 }
 
+/** Default 3, floor 1, cap 6. */
+export function parallelBatchLimit(value) {
+  const raw = value === undefined || value === null || value === '' ? 3 : Number(value);
+  if (!Number.isFinite(raw)) return 3;
+  return Math.min(6, Math.max(1, Math.trunc(raw)));
+}
+
+/**
+ * Small worker pool. After one task fails, no new indexes are started;
+ * already-claimed workers finish (so onBatchComplete can persist).
+ */
+export async function runPool(items, concurrency, worker) {
+  const list = items || [];
+  if (!list.length) return [];
+
+  const limit = Math.min(parallelBatchLimit(concurrency), list.length);
+  let next = 0;
+  let firstError;
+  const results = new Array(list.length);
+
+  async function consume() {
+    for (;;) {
+      if (firstError) return;
+      const index = next;
+      next += 1;
+      if (index >= list.length) return;
+      try {
+        results[index] = await worker(list[index], index);
+      } catch (err) {
+        if (!firstError) firstError = err;
+        return;
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: limit }, () => consume()));
+  if (firstError) throw firstError;
+  return results;
+}
+
 function extractTrackingId(body) {
   return (
     body?.trackingId ||
@@ -211,33 +251,44 @@ async function pollUntilDone(trackingId, emails, { onProgress } = {}) {
  *
  * Returns { results: Map, creditsUsed, batches, trackingIds }
  */
-export async function validateBulk(emails, { onProgress, onBatchComplete, batchSize, cohort } = {}) {
+export async function validateBulk(
+  emails,
+  {
+    onProgress,
+    onBatchComplete,
+    batchSize,
+    cohort,
+    parallelBatches,
+    submitBatch: submitFn = submitBatch,
+    pollUntilDone: pollFn = pollUntilDone,
+  } = {}
+) {
   if (!emails.length) {
     return { results: new Map(), creditsUsed: 0, batches: 0, trackingIds: [] };
   }
 
   const chunks = chunkEmails(emails, batchSize ?? config.n2bSubmitBatchSize);
+  const concurrency = parallelBatchLimit(parallelBatches ?? config.n2bParallelBatches);
   const results = new Map();
   let creditsUsed = 0;
-  const trackingIds = [];
+  const trackingIds = new Array(chunks.length);
   const label = cohort ? ` cohort=${cohort}` : '';
 
   if (onProgress) {
     await onProgress(
-      `no2bounce submitting ${emails.length} emails in ${chunks.length} batch(es)${label} (batchSize=${batchSize ?? config.n2bSubmitBatchSize})`
+      `no2bounce submitting ${emails.length} emails in ${chunks.length} batch(es)${label} (batchSize=${batchSize ?? config.n2bSubmitBatchSize}, parallel=${concurrency})`
     );
   }
 
-  for (let i = 0; i < chunks.length; i += 1) {
-    const chunk = chunks[i];
+  await runPool(chunks, concurrency, async (chunk, i) => {
     if (onProgress) {
       await onProgress(
         `no2bounce batch ${i + 1}/${chunks.length}${label}: submitting ${chunk.length} emails`
       );
     }
 
-    const { trackingId } = await submitBatch(chunk);
-    trackingIds.push(trackingId);
+    const { trackingId } = await submitFn(chunk);
+    trackingIds[i] = trackingId;
 
     if (onProgress) {
       await onProgress(
@@ -245,12 +296,13 @@ export async function validateBulk(emails, { onProgress, onBatchComplete, batchS
       );
     }
 
-    const batchResult = await pollUntilDone(trackingId, chunk, { onProgress });
+    const batchResult = await pollFn(trackingId, chunk, { onProgress });
     creditsUsed += batchResult.creditsUsed;
     for (const [email, value] of batchResult.results) {
       results.set(email, value);
     }
 
+    // Resume treats a batch as done only after this save hook returns.
     if (onBatchComplete) {
       await onBatchComplete({
         cohort,
@@ -269,7 +321,9 @@ export async function validateBulk(emails, { onProgress, onBatchComplete, batchS
         `no2bounce batch ${i + 1}/${chunks.length}${label} complete: deliverable=${deliverable}/${chunk.length}, credits+=${batchResult.creditsUsed}`
       );
     }
-  }
+
+    return batchResult;
+  });
 
   return {
     results,
@@ -288,22 +342,25 @@ export async function validateCohorts({
   onProgress,
   onBatchComplete,
   batchSize,
+  parallelBatches,
+  submitBatch,
+  pollUntilDone,
 } = {}) {
   const catchAll = catchAllEmails || [];
   const unknown = unknownEmails || [];
+  const shared = {
+    onProgress,
+    onBatchComplete,
+    batchSize,
+    parallelBatches,
+    submitBatch,
+    pollUntilDone,
+  };
 
-  const catchAllResult = await validateBulk(catchAll, {
-    onProgress,
-    onBatchComplete,
-    batchSize,
-    cohort: 'catch_all',
-  });
-  const unknownResult = await validateBulk(unknown, {
-    onProgress,
-    onBatchComplete,
-    batchSize,
-    cohort: 'unknown',
-  });
+  const [catchAllResult, unknownResult] = await Promise.all([
+    validateBulk(catchAll, { ...shared, cohort: 'catch_all' }),
+    validateBulk(unknown, { ...shared, cohort: 'unknown' }),
+  ]);
 
   const results = new Map([
     ...catchAllResult.results,

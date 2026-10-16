@@ -32,6 +32,7 @@ import {
   classifyEmailsByMx,
   mxRecordFromLookup,
 } from './providers/mx-lookup.js';
+import { createMutex } from './lib/mutex.js';
 import { validateCohorts } from './providers/no2bounce.js';
 import {
   downloadFile,
@@ -301,6 +302,7 @@ async function runN2bStage({
 
   let workingRows = addressRows;
   let creditsSoFar = priorCredits;
+  const saveBatch = createMutex();
 
   const n2b = await validateCohorts({
     catchAllEmails,
@@ -308,14 +310,20 @@ async function runN2bStage({
     onProgress: async (message) => {
       await addLog(runId, message);
     },
+    // Batches (and cohorts) may finish in any order. Serialize the merge+save
+    // so a later callback cannot clobber an earlier persist. A batch is only
+    // "done" for resume after this hook returns — pending rows keep n2b_status null.
     onBatchComplete: async ({ batchResults, creditsUsed }) => {
-      workingRows = applyN2bToAddressRows(workingRows, batchResults);
-      await upsertAddressResults(runId, workingRows);
-      creditsSoFar += creditsUsed;
-      await updateRun(runId, {
-        n2b_credits_used: creditsSoFar,
-        // Keep stage at mv until all N2B batches finish — resume skips only completed addresses
-        stage_completed: 'mv',
+      await saveBatch(async () => {
+        workingRows = applyN2bToAddressRows(workingRows, batchResults);
+        const touched = workingRows.filter((row) => batchResults.has(row.email));
+        await upsertAddressResults(runId, touched.length ? touched : workingRows);
+        creditsSoFar += creditsUsed;
+        await updateRun(runId, {
+          n2b_credits_used: creditsSoFar,
+          // Keep stage at mv until all N2B batches finish — resume skips only completed addresses
+          stage_completed: 'mv',
+        });
       });
     },
   });
